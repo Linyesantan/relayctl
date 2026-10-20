@@ -1,0 +1,58 @@
+local:
+  base: http://127.0.0.1:3001
+  access_token: "your-local-root-system-access-token"
+  user_id: 1
+  # 渠道 key 不通过 API 返回，同步前备份与失败回滚都以只读方式从这里读明文 key。
+  # db_path 直读；若卷目录权限不足（常见 root:700），自动退回 docker exec 取快照。
+  db_path: /var/lib/docker/volumes/new-api_new-api-data/_data/one-api.db
+  db_container: new-api
+  db_container_path: /data/one-api.db
+
+sites:
+  kuaipao:
+    tier: api
+    adapter: newapi
+    base: https://kuaipao.ai
+    proxy: http://127.0.0.1:7890
+    auth:
+      access_token: "upstream-system-access-token"
+      user_id: 12345
+    local_channel: 1
+    currency:
+      display: CUSTOM
+      rate: null
+    low_balance: 5.0
+    parked_reason: null
+    todo: null
+
+  wusrouter:
+    tier: script
+    adapter: wusrouter
+    base: https://wusrouter.com
+    proxy: http://127.0.0.1:7890
+    auth:
+      access_token: ""
+      user_id: null
+    local_channel: 4
+    currency:
+      display: USD
+      rate: null
+    low_balance: null
+    parked_reason: null
+    todo: null
+
+  aiapi.bot:
+    tier: parked
+    adapter: newapi
+    base: https://cn.aiapi.bot
+    proxy: http://127.0.0.1:7890
+    auth:
+      access_token: ""
+      user_id: null
+    local_channel: 8
+    currency:
+      display: CNY
+      rate: null
+    low_balance: null
+    parked_reason: "无登录态，管理接口未知（常见路径 404，/docs 为 SPA）"
+    todo: "在 Chrome 登录 cn.aiapi.bot 后抓包，判断升为 api 或 script"

@@ -1,0 +1,30 @@
+# 敏感私有配置文件（严禁提交）
+sites.yaml
+*.env
+*.secret
+
+# 运行时状态、缓存与备份
+state/
+backup/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Python 字节码与虚拟环境
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+dist/
+build/
+*.egg-info/
+
+# 操作系统与 IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
