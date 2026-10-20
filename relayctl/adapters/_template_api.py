@@ -37,8 +37,10 @@ class CustomApiAdapter(BaseAdapter):
         # 实现 Key 列表读取
         return []
 
-    def create_key(self, name: str, group: str, quota: float, models: list = None) -> dict:
+    def create_key(self, name: str, group: str, quota: float = None,
+                   unlimited: bool = False, models: list = None) -> dict:
         raise NotSupported("新建 Key 暂未实现")
 
-    def update_key(self, key_id: int, group: str = None, status: int = None, quota: float = None, name: str = None) -> dict:
+    def update_key(self, key_id: int, group: str = None, status: int = None, quota: float = None,
+                   name: str = None, unlimited: bool = False) -> dict:
         raise NotSupported("更新 Key 暂未实现")

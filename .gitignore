@@ -1,11 +1,15 @@
 # 敏感私有配置文件（严禁提交）
 sites.yaml
+config.yaml
+sites/
 *.env
 *.secret
 
 # 运行时状态、缓存与备份
 state/
 backup/
+cache/
+logs/
 *.db
 *.sqlite
 *.sqlite3

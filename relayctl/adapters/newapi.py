@@ -3,6 +3,7 @@ import math
 from typing import Dict, Any, List, Optional
 from .base import BaseAdapter, NotSupported
 from ..core import HttpClient, mask_key, AuthError
+from .. import models
 
 class NewAPIAdapter(BaseAdapter):
     NAME = "newapi"
@@ -156,47 +157,47 @@ class NewAPIAdapter(BaseAdapter):
         }
 
     def groups(self) -> list:
-        groups_list = []
+        """只走主接口 /api/user/self/groups。
+
+        主接口失败（含无数据）一律报 NotSupported：不再回落到 /api/pricing
+        （避免高频扫描敏感端点），也不编造 default 分组。
+        """
+        groups_list: List[Dict[str, Any]] = []
         try:
             r = self.client.get("/api/user/self/groups")
             self._check_auth_response(r)
-            if r.status_code == 200:
-                d = r.json()
-                self._check_auth_response(r, d)
-                data = d.get("data", {})
-                if isinstance(data, dict):
-                    for g_name, val in data.items():
-                        if isinstance(val, dict):
-                            desc = val.get("desc") or val.get("description") or ""
-                            ratio = val.get("ratio", 1)
-                        else:
-                            desc = ""
-                            ratio = val
-                        groups_list.append({"name": g_name, "desc": desc, "ratio": ratio})
-                elif isinstance(data, list):
-                    for g in data:
-                        groups_list.append({"name": g.get("name"), "desc": g.get("description", ""), "ratio": g.get("ratio", 1)})
-        except AuthError:
+            if r.status_code != 200:
+                raise NotSupported(
+                    f"站点 {self.name} 的分组接口不可用（HTTP {r.status_code}），无法读取分组。"
+                )
+            d = r.json()
+            self._check_auth_response(r, d)
+            data = d.get("data", {})
+            if isinstance(data, dict):
+                for g_name, val in data.items():
+                    if isinstance(val, dict):
+                        desc = val.get("desc") or val.get("description") or ""
+                        ratio = val.get("ratio", 1)
+                    else:
+                        desc = ""
+                        ratio = val
+                    groups_list.append({"name": g_name, "desc": desc, "ratio": ratio})
+            elif isinstance(data, list):
+                for g in data:
+                    groups_list.append({
+                        "name": g.get("name"),
+                        "desc": g.get("description", ""),
+                        "ratio": g.get("ratio", 1),
+                    })
+        except (AuthError, NotSupported):
             raise
-        except Exception:
-            pass
+        except Exception as e:
+            raise NotSupported(f"站点 {self.name} 的分组接口不可用（{e}），无法读取分组。")
 
         if not groups_list:
-            try:
-                r = self.client.get("/api/pricing")
-                if r.status_code == 200:
-                    data = r.json().get("data", {})
-                    found = set()
-                    for item in (data if isinstance(data, list) else []):
-                        g = item.get("group")
-                        if g and g not in found:
-                            found.add(g)
-                            groups_list.append({"name": g, "desc": "来自模型定价", "ratio": 1.0})
-            except Exception:
-                pass
-
-        if not groups_list:
-            groups_list.append({"name": "default", "desc": "默认分组", "ratio": 1.0})
+            raise NotSupported(
+                f"站点 {self.name} 的分组接口未返回任何分组，拒绝编造 default 分组。"
+            )
         return groups_list
 
     def list_keys(self) -> list:
@@ -284,27 +285,31 @@ class NewAPIAdapter(BaseAdapter):
         for it in all_items:
             if not isinstance(it, dict):
                 continue
-            key_val = it.get("key", "")
-            remain = "无限" if it.get("unlimited_quota") else f"{it.get('remain_quota', 0) / unit:.4f}"
+            unlimited = bool(it.get("unlimited_quota"))
+            remain = "无限" if unlimited else f"{it.get('remain_quota', 0) / unit:.4f}"
             used = f"{it.get('used_quota', 0) / unit:.4f}"
-            status_str = "启用" if it.get("status") == 1 else "禁用"
-            keys.append({
+            # 统一走稳定字段规范化：输出永远不含 _raw_key / 明文 key
+            normalized = models.normalize_key({
                 "id": it.get("id"),
                 "name": it.get("name"),
                 "group": it.get("group", "default"),
-                "status": status_str,
+                "status": it.get("status"),
+                "unlimited": unlimited,
                 "remain": remain,
                 "used": used,
-                "key_masked": mask_key(key_val),
-                "_raw_key": key_val,
+                "key": it.get("key", ""),
+                "models": it.get("model_limits") or "",
             })
+            if normalized:
+                keys.append(normalized)
         return keys
 
-    def create_key(self, name: str, group: str, quota: float, models: list = None) -> dict:
+    def create_key(self, name: str, group: str, quota: float = None,
+                   unlimited: bool = False, models: list = None) -> dict:
         self._ensure_probed()
         unit = self.quota_per_unit or 500000
-        # 只有显式的无限额度（quota is None）才算无限；--quota 必须 > 0
-        is_unlimited = (quota is None)
+        # 显式 --unlimited 或从未指定额度（quota is None）才算无限；--quota 必须 > 0
+        is_unlimited = bool(unlimited) or (quota is None)
         if not is_unlimited and quota <= 0:
             raise ValueError(
                 f"额度必须大于 0（收到 {quota}）！只有显式指定 --unlimited 才会创建无限额度 Key。"
@@ -350,13 +355,13 @@ class NewAPIAdapter(BaseAdapter):
             key_id = res_data
             
         # 若创建接口未直接返回 id，通过创建前后列表差集精准匹配新出现的 Key
+        # 差集只依赖 id / name，绝不以 _raw_key（明文）作为匹配依据
         if not key_id and before_snapshot_ok:
             try:
                 after_keys = self.list_keys()
                 new_created = [k for k in after_keys if k.get("id") not in before_ids and k.get("name") == name]
                 if len(new_created) == 1:
                     key_id = new_created[0]["id"]
-                    key_val = new_created[0]["_raw_key"]
                 elif len(new_created) > 1:
                     raise Exception(f"匹配到多个同名且新创建的 Key ({name})，无法唯一确定 ID！")
             except Exception as e:
@@ -367,7 +372,18 @@ class NewAPIAdapter(BaseAdapter):
             raise NotSupported(
                 f"站点 {self.name} 创建 Key 后未能可靠确认新 Key ID，拒绝按名称认领已有 Key。"
             )
-        return {"id": key_id, "key_masked": mask_key(key_val), "_raw_key": key_val}
+        result = {
+            "id": key_id,
+            "name": name,
+            "group": group,
+            "unlimited": is_unlimited,
+            "key_masked": mask_key(key_val),
+        }
+        # 仅当创建响应确实带回明文 key 时才在内部保留 secret 字段；
+        # CLI / Web 一律只输出 key_masked。
+        if key_val:
+            result["_raw_key"] = key_val
+        return result
 
     def update_key(self, key_id: int, group: str = None, status: int = None, quota: float = None, name: str = None, unlimited: bool = False) -> dict:
         self._ensure_probed()

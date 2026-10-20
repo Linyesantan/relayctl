@@ -9,8 +9,11 @@ def register_adapter(name: str, cls):
     ADAPTER_REGISTRY[name] = cls
 
 def get_adapter(name: str, site_cfg: dict, core_cfg: dict) -> BaseAdapter:
-    tier = site_cfg.get("tier", "parked")
-    if tier == "parked":
+    # 兼容 v1 的 tier 与 v2 的 status
+    tier = site_cfg.get("tier")
+    if not tier:
+        tier = "api" if str(site_cfg.get("status", "parked")).lower() == "active" else "parked"
+    if str(tier).lower() == "parked":
         return ParkedAdapter(name, site_cfg, core_cfg)
         
     adapter_name = site_cfg.get("adapter", "newapi")

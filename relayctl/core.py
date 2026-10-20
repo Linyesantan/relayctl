@@ -1,158 +1,147 @@
-import os
-import sys
-import yaml
-import json
-import requests
-import tempfile
+"""HTTP 客户端、安全会话与通用工具。
+
+v2: 路径与安全写盘统一由 paths 模块提供；本模块保留旧名称（secure_write_json /
+ensure_secure_dir / mask_key / AuthError / load_config / save_config）以兼容旧调用方。
+"""
+
+from typing import Optional
 from urllib.parse import urlparse
-from typing import Dict, Any, Optional
 
-CONFIG_DIR = os.path.expanduser("~/.config/relayctl")
-CONFIG_PATH = os.path.join(CONFIG_DIR, "sites.yaml")
-STATE_DIR = os.path.join(CONFIG_DIR, "state")
-BACKUP_DIR = os.path.join(CONFIG_DIR, "backup")
+import requests
 
-class AuthError(Exception):
-    """鉴权失败异常（HTTP 401 或业务错误码 AUTH_*）"""
-    pass
+from . import paths
+from .errors import AuthError, ConfigError, NotSupported  # noqa: F401 (兼容旧导入)
+from .models import mask_key  # noqa: F401 (兼容旧导入)
 
-def mask_key(k: str) -> str:
-    """脱敏 Key：仅显示前 4 后 4，其余用 * 遮盖"""
-    if not k:
-        return ""
-    if len(k) <= 10:
-        return "***"
-    return f"{k[:4]}...{k[-4:]}"
+USER_AGENT = "relayctl/2.0"
+
+# 跨 origin 重定向时绝不允许带走的凭据头
+SENSITIVE_HEADERS = ("authorization", "token", "x-api-key", "new-api-user", "cookie")
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
 
 def ensure_secure_dir(path: str):
-    os.makedirs(path, mode=0o700, exist_ok=True)
-    try:
-        os.chmod(path, 0o700)
-    except Exception:
-        pass
+    """创建目录并强制 0700。"""
+    return paths.ensure_dir(path)
 
-def secure_write_json(file_path: str, data: Any):
-    """安全写入 JSON 文件并确保 600 权限"""
-    ensure_secure_dir(os.path.dirname(file_path))
-    fd, tmp_path = tempfile.mkstemp(prefix=f".{os.path.basename(file_path)}.",
-                                     dir=os.path.dirname(file_path), text=True)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            fd = None
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, file_path)
-    finally:
-        if fd is not None:
-            os.close(fd)
-        try:
-            os.unlink(tmp_path)
-        except FileNotFoundError:
-            pass
 
-def load_config() -> dict:
-    ensure_secure_dir(CONFIG_DIR)
-    ensure_secure_dir(STATE_DIR)
-    ensure_secure_dir(BACKUP_DIR)
-    
-    if not os.path.exists(CONFIG_PATH):
-        # 默认基础骨架
-        cfg = {
-            "local": {
-                "base": "http://127.0.0.1:3001",
-                "access_token": "",
-                "user_id": 1
-            },
-            "sites": {}
-        }
-        save_config(cfg)
-        return cfg
-        
-    # 强制检查权限
-    try:
-        os.chmod(CONFIG_PATH, 0o600)
-    except Exception:
-        pass
-        
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+def secure_write_json(file_path: str, data):
+    """原子写 JSON 并确保 600 权限（用于兼容旧调用方）。"""
+    return paths.atomic_write_json(file_path, data)
 
-def save_config(cfg: dict):
-    """原子写入配置：临时文件 -> chmod 600 -> os.replace，避免写一半崩溃损坏 sites.yaml"""
-    ensure_secure_dir(CONFIG_DIR)
-    fd, tmp_path = tempfile.mkstemp(prefix=f".{os.path.basename(CONFIG_PATH)}.",
-                                     dir=CONFIG_DIR, text=True)
+
+def ensure_secure_file(path: str):
+    return paths.ensure_file_mode(path)
+
+
+def load_config(resolve: bool = True, init: bool = True) -> dict:
+    """兼容包装：返回 {sites: {...}, ...}（v2 布局）。"""
+    from .config import load_config as _load_config
+    return _load_config(resolve=resolve, init=init)
+
+
+def save_config(cfg: dict) -> dict:
+    """兼容包装：全局键写 config.yaml，站点写 sites/<name>.yaml。"""
+    from .config import save_config as _save_config
+    return _save_config(cfg)
+
+
+def _origin(parsed) -> tuple:
+    """规范化 origin（默认端口归一化，避免 :443 与隐式 443 被判为不同源）。"""
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower()
+    port = parsed.port
+    if port is None:
+        port = _DEFAULT_PORTS.get(scheme)
+    return (scheme, host, port)
+
+
+def _has_sensitive_header(headers) -> bool:
+    if not headers:
+        return False
     try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            fd = None
-            yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, CONFIG_PATH)
-    finally:
-        if fd is not None:
-            os.close(fd)
-        try:
-            os.unlink(tmp_path)
-        except FileNotFoundError:
-            pass
+        keys = {str(k).lower() for k in headers.keys()}
+    except Exception:  # pragma: no cover - 异常头部容器
+        return True
+    return any(name in keys for name in SENSITIVE_HEADERS)
+
 
 class _SafeSession(requests.Session):
-    """不要把管理认证头跟随跨 origin 重定向发送。"""
+    """不要把管理认证头跟随跨 origin 重定向发送。
+
+    任何携带 Authorization / Token / x-api-key / New-Api-User / Cookie 的请求，
+    一旦被重定向到不同 origin（含 scheme、host、端口差异），直接拒绝，
+    而不是把凭据发给第三方主机。
+    """
+
     def rebuild_auth(self, prepared_request, response):
         old = urlparse(response.request.url)
         new = urlparse(prepared_request.url)
-        old_origin = (old.scheme.lower(), old.hostname.lower() if old.hostname else "", old.port)
-        new_origin = (new.scheme.lower(), new.hostname.lower() if new.hostname else "", new.port)
+        if _origin(old) != _origin(new):
+            # 原始请求或即将发出的请求只要带过凭据头，就拒绝跨 origin 重定向
+            if (_has_sensitive_header(getattr(response.request, "headers", None))
+                    or _has_sensitive_header(prepared_request.headers)):
+                raise requests.exceptions.TooManyRedirects(
+                    f"拒绝带认证请求的跨 origin 重定向: {response.request.url} -> {prepared_request.url}")
         super().rebuild_auth(prepared_request, response)
-        auth_headers = ("Authorization", "Token", "x-api-key", "New-Api-User")
-        if old_origin != new_origin and any(name in prepared_request.headers for name in auth_headers):
-            raise requests.exceptions.TooManyRedirects(
-                "拒绝带认证请求的跨 origin 重定向")
+
 
 class HttpClient:
     """带有代理、超时与通用安全头的统一 HTTP 客户端"""
+
     def __init__(self, base_url: str, proxy: Optional[str] = None, auth: Optional[dict] = None):
-        self.base_url = base_url.rstrip("/")
-        self.proxy = proxy
+        self.base_url = (base_url or "").rstrip("/")
         self.auth = auth or {}
         self.session = _SafeSession()
-        
-        mode = (self.proxy or "none").strip() if isinstance(self.proxy, str) else "none"
-        if mode.lower() == "auto":
+        self.proxy = self._apply_proxy(proxy)
+
+    def _apply_proxy(self, proxy) -> Optional[str]:
+        """proxy 必须是字符串或 None；非法类型报配置错误，绝不静默降级。"""
+        if proxy is None:
+            mode = "none"
+        elif isinstance(proxy, str):
+            mode = proxy.strip() or "none"
+        else:
+            raise ConfigError(
+                f"proxy 必须是字符串（none / auto / http://host:port）或 None，"
+                f"收到 {type(proxy).__name__}"
+            )
+        lowered = mode.lower()
+        if lowered == "auto":
             # auto: 跟随系统环境变量代理（HTTP(S)_PROXY / ALL_PROXY），未设置则直连
             self.session.trust_env = True
-        elif mode.lower() in ("none", "direct", ""):
+            self.session.proxies = {}
+        elif lowered in ("none", "direct"):
             # 强制直连，避免被系统代理干扰
             self.session.trust_env = False
+            self.session.proxies = {}
         else:
             self.session.trust_env = False
             self.session.proxies = {"http": mode, "https": mode}
+        return mode
 
     def get_headers(self, custom_headers: Optional[dict] = None) -> dict:
         headers = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/plain, */*"
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json, text/plain, */*",
         }
         token = self.auth.get("access_token")
         uid = self.auth.get("user_id")
         cookie = self.auth.get("cookie")
-        
+
         if token:
-            if token.startswith("user-"):
+            if str(token).startswith("user-"):
                 headers["x-api-key"] = token
             else:
-                headers["Authorization"] = token if token.startswith("Bearer ") else f"Bearer {token}"
+                headers["Authorization"] = token if str(token).startswith("Bearer ") else f"Bearer {token}"
             # 同时保留两者兼容某些需要特定头的端点
             headers["Token"] = token
         if uid:
             headers["New-Api-User"] = str(uid)
         if cookie:
             headers["Cookie"] = cookie
-            
+
         if custom_headers:
             headers.update(custom_headers)
         return headers
@@ -175,6 +164,7 @@ class HttpClient:
     def delete(self, path: str, **kwargs) -> requests.Response:
         return self.request("DELETE", path, **kwargs)
 
+
 def print_table(headers: list, rows: list):
     """简易整齐对齐表格打印"""
     if not rows:
@@ -189,7 +179,7 @@ def print_table(headers: list, rows: list):
                 w += 2 if ord(ch) > 127 else 1
             if i < len(col_widths):
                 col_widths[i] = max(col_widths[i], w)
-                
+
     header_line = " | ".join(str(h).ljust(col_widths[i]) for i, h in enumerate(headers))
     sep_line = "-+-".join("-" * col_widths[i] for i in range(len(headers)))
     print(header_line)
@@ -202,3 +192,12 @@ def print_table(headers: list, rows: list):
             pad = col_widths[i] - w
             line_parts.append(s + " " * max(0, pad))
         print(" | ".join(line_parts))
+
+
+def home_dir() -> str:
+    """当前 RELAYCTL_HOME（动态）。"""
+    return paths.home()
+
+
+def state_dir() -> str:  # 兼容旧调用方
+    return paths.cache_dir()

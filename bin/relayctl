@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 relayctl: 统一多上游 AI 中转站 Key 与余额管理的轻量级工具 (CLI + Web)
+v2 运行时布局: $RELAYCTL_HOME/{config.yaml,sites/<name>.yaml,scripts/,cache/,dist/,logs/}
 """
 
 import sys
@@ -8,26 +9,25 @@ import os
 import argparse
 import json
 import getpass
-import re
-import datetime
-from typing import Optional, List, Union
+from typing import Optional
 
 current_dir = os.path.dirname(os.path.realpath(__file__))
 parent_dir = os.path.dirname(current_dir)
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
-from relayctl.core import load_config, save_config, print_table, mask_key, HttpClient, AuthError
-from relayctl.adapters import get_adapter
-from relayctl.adapters.base import ParkedAdapter, NotSupported
-from relayctl import cache as rcache
+from relayctl import __version__  # noqa: E402
+from relayctl import config as rconfig  # noqa: E402
+from relayctl import migrate as rmigrate  # noqa: E402
+from relayctl import paths  # noqa: E402
+from relayctl.core import print_table  # noqa: E402
+from relayctl.errors import (  # noqa: E402
+    EXIT_OK, EXIT_FAIL, EXIT_AUTH, EXIT_NOTSUPPORTED, EXIT_USAGE,
+    AuthError, ConfigError, NotSupported,
+)
+from relayctl.adapters import get_adapter  # noqa: E402
+from relayctl import cache as rcache  # noqa: E402
 
-# 退出码
-EXIT_OK = 0             # 成功
-EXIT_FAIL = 1           # 一般失败
-EXIT_AUTH = 2           # 鉴权失败（401 / AUTH_*）
-EXIT_NOTSUPPORTED = 3   # 站点或适配器不支持该操作
-EXIT_USAGE = 4          # 参数或配置问题
 
 def cache_note(meta) -> str:
     """标注数据的最新更新时间。"""
@@ -37,73 +37,66 @@ def cache_note(meta) -> str:
         return f"最新更新时间: {meta.get('fetched_at')}（缓存，{rcache.age_text(meta['ts'])}；--refresh 重新拉取）"
     return f"最新更新时间: {meta.get('fetched_at')}（刚刚实时拉取）"
 
-def cmd_balance(args, cfg):
-    name = args.site
+
+def _site(cfg: dict, name: str):
     sites = cfg.get("sites", {})
     s_cfg = sites.get(name)
     if not s_cfg:
-        print(f"[!] 站点 {name} 未登记")
-        return EXIT_USAGE
-    adapter = get_adapter(name, s_cfg, cfg)
-    try:
-        b, meta = rcache.fetch(name, "balance", adapter.balance, rcache.mode_from_args(args))
-        print(f"--- 站点 {name} 余额详情 ---")
-        print(cache_note(meta))
-        print(f"当前额度: {b.get('balance')} (原始配额: {b.get('raw_quota')})")
-        print(f"已用额度: {b.get('used')} (原始用量: {b.get('raw_used')})")
-        print(f"配额底数: {b.get('quota_per_unit', 500000)}")
-        print(f"站点标注: {b.get('display_type', 'USD')} (仅供参考，不作换算)")
-        print(f"用户分组: {b.get('user_group')}")
-        return EXIT_OK
-    except AuthError as ae:
-        print(f"[!] 鉴权失败: {ae}")
-        return EXIT_AUTH
-    except NotSupported as ns:
-        print(f"[!] {ns}")
-        return EXIT_NOTSUPPORTED
-    except Exception as e:
-        print(f"[!] 获取余额失败: {e}")
-        return EXIT_FAIL
+        raise ConfigError(f"站点 {name} 未登记（{paths.site_path(name) if name else ''}）")
+    return s_cfg
+
+
+def cmd_balance(args, cfg):
+    s_cfg = _site(cfg, args.site)
+    adapter = get_adapter(args.site, s_cfg, cfg)
+    b, meta = rcache.fetch(args.site, "balance", adapter.balance, rcache.mode_from_args(args))
+    print(f"--- 站点 {args.site} 余额详情 ---")
+    print(cache_note(meta))
+    print(f"当前额度: {b.get('balance')} (原始配额: {b.get('raw_quota')})")
+    print(f"已用额度: {b.get('used')} (原始用量: {b.get('raw_used')})")
+    print(f"配额底数: {b.get('quota_per_unit', 500000)}")
+    print(f"站点标注: {b.get('display_type', 'USD')} (仅供参考，不作换算)")
+    print(f"用户分组: {b.get('user_group')}")
+    return EXIT_OK
+
 
 def cmd_status(args, cfg):
     sites = cfg.get("sites", {})
     c_mode = rcache.mode_from_args(args)
-    
+
     if args.json:
         result = {}
         for name, s_cfg in sites.items():
-            adapter = get_adapter(name, s_cfg, cfg)
             tier = s_cfg.get("tier", "parked")
             if tier == "parked":
-                result[name] = {
-                    "tier": "parked",
-                    "reason": s_cfg.get("parked_reason")
-                }
-            else:
+                result[name] = {"tier": "parked", "reason": s_cfg.get("parked_reason")}
+                continue
+            try:
+                adapter = get_adapter(name, s_cfg, cfg)
+                b, b_meta = rcache.fetch(name, "balance", adapter.balance, c_mode)
+                key_count = None
+                keys_error = None
                 try:
-                    b, b_meta = rcache.fetch(name, "balance", adapter.balance, c_mode)
-                    key_count = None
-                    keys_error = None
-                    try:
-                        keys, _ = rcache.fetch(name, "keys", adapter.list_keys, c_mode)
-                        key_count = len(keys)
-                    except Exception as e:
-                        keys_error = str(e)
-                    result[name] = {
-                        "tier": tier,
-                        "balance": b.get("balance"),
-                        "used": b.get("used"),
-                        "quota_per_unit": b.get("quota_per_unit"),
-                        "display_type": b.get("display_type"),
-                        "group": b.get("user_group"),
-                        "key_count": key_count,
-                        "keys_error": keys_error,
-                        "from_cache": b_meta["from_cache"]
-                    }
-                except AuthError as ae:
-                    result[name] = {"tier": tier, "error": f"鉴权失败: {ae}"}
+                    keys, _ = rcache.fetch(name, "keys", adapter.list_keys, c_mode)
+                    key_count = len(keys)
                 except Exception as e:
-                    result[name] = {"tier": tier, "error": str(e)}
+                    keys_error = str(e)
+                result[name] = {
+                    "tier": tier,
+                    "status": s_cfg.get("status"),
+                    "balance": b.get("balance"),
+                    "used": b.get("used"),
+                    "quota_per_unit": b.get("quota_per_unit"),
+                    "display_type": b.get("display_type"),
+                    "group": b.get("user_group"),
+                    "key_count": key_count,
+                    "keys_error": keys_error,
+                    "from_cache": b_meta["from_cache"],
+                }
+            except AuthError as ae:
+                result[name] = {"tier": tier, "error": f"鉴权失败: {ae}"}
+            except Exception as e:
+                result[name] = {"tier": tier, "error": str(e)}
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return EXIT_OK
 
@@ -111,229 +104,52 @@ def cmd_status(args, cfg):
     rows = []
 
     for name, s_cfg in sites.items():
-        adapter = get_adapter(name, s_cfg, cfg)
         tier = s_cfg.get("tier", "parked")
-
         if tier == "parked":
-            rows.append([
-                name, tier, "-", "-", "-", "-", "-",
-                s_cfg.get("parked_reason") or "缺少凭据"
-            ])
-        else:
-            try:
-                b, _ = rcache.fetch(name, "balance", adapter.balance, c_mode)
-                bal = str(b.get("balance", "-"))
-                used = str(b.get("used", "-"))
-                group = b.get("user_group", "-")
-                display_type = b.get("display_type", "")
-                
-                try:
-                    keys, _ = rcache.fetch(name, "keys", adapter.list_keys, c_mode)
-                    k_count = str(len(keys))
-                except Exception:
-                    k_count = "获取失败"
+            rows.append([name, tier, "-", "-", "-", "-", "-",
+                         s_cfg.get("parked_reason") or "缺少凭据"])
+            continue
+        try:
+            adapter = get_adapter(name, s_cfg, cfg)
+            b, _ = rcache.fetch(name, "balance", adapter.balance, c_mode)
+            bal = str(b.get("balance", "-"))
+            used = str(b.get("used", "-"))
+            group = b.get("user_group", "-")
+            display_type = b.get("display_type", "")
 
-                rows.append([name, tier, bal, used, group, k_count, display_type, "正常活跃"])
-            except AuthError as ae:
-                rows.append([name, tier, "-", "-", "-", "-", "-", f"鉴权失效 ({ae})"])
-            except NotSupported as ns:
-                rows.append([name, tier, "-", "-", "-", "-", "-", str(ns)])
-            except Exception as e:
-                rows.append([name, tier, "-", "-", "-", "-", "-", f"异常: {e}"])
+            try:
+                keys, _ = rcache.fetch(name, "keys", adapter.list_keys, c_mode)
+                k_count = str(len(keys))
+            except Exception:
+                k_count = "获取失败"
+
+            rows.append([name, tier, bal, used, group, k_count, display_type, "正常活跃"])
+        except AuthError as ae:
+            rows.append([name, tier, "-", "-", "-", "-", "-", f"鉴权失效 ({ae})"])
+        except NotSupported as ns:
+            rows.append([name, tier, "-", "-", "-", "-", "-", str(ns)])
+        except Exception as e:
+            rows.append([name, tier, "-", "-", "-", "-", "-", f"异常: {e}"])
 
     print_table(headers, rows)
     return EXIT_OK
 
-def cmd_groups(args, cfg):
-    name = args.site
-    sites = cfg.get("sites", {})
-    s_cfg = sites.get(name)
-    if not s_cfg:
-        print(f"[!] 站点 {name} 未登记")
-        return EXIT_USAGE
-    adapter = get_adapter(name, s_cfg, cfg)
-    try:
-        g_list, meta = rcache.fetch(name, "groups", adapter.groups, rcache.mode_from_args(args))
-        if meta.get("from_cache"):
-            print(cache_note(meta))
-        headers = ["分组名称", "说明", "倍率"]
-        rows = []
-        for g in g_list:
-            rows.append([g.get("name", ""), g.get("desc", ""), str(g.get("ratio", ""))])
-        print_table(headers, rows)
-        return EXIT_OK
-    except AuthError as ae:
-        print(f"[!] 鉴权失败: {ae}")
-        return EXIT_AUTH
-    except NotSupported as ns:
-        print(f"[!] {ns}")
-        return EXIT_NOTSUPPORTED
-    except Exception as e:
-        print(f"[!] 获取分组失败: {e}")
-        return EXIT_FAIL
-
-def cmd_keys(args, cfg):
-    name = args.site
-    sites = cfg.get("sites", {})
-    s_cfg = sites.get(name)
-    if not s_cfg:
-        print(f"[!] 站点 {name} 未登记")
-        return EXIT_USAGE
-    adapter = get_adapter(name, s_cfg, cfg)
-    try:
-        k_list, meta = rcache.fetch(name, "keys", adapter.list_keys, rcache.mode_from_args(args))
-        if meta.get("from_cache"):
-            print(cache_note(meta))
-        headers = ["ID", "名称", "分组", "状态", "剩余额度", "已用额度", "Key (脱敏)"]
-        rows = []
-        for k in k_list:
-            rows.append([
-                str(k.get("id", "")),
-                k.get("name", ""),
-                k.get("group", ""),
-                "启用" if k.get("status") == 1 else "禁用",
-                str(k.get("remain_quota", "")),
-                str(k.get("used_quota", "")),
-                k.get("key", "")
-            ])
-        print_table(headers, rows)
-        return EXIT_OK
-    except AuthError as ae:
-        print(f"[!] 鉴权失败: {ae}")
-        return EXIT_AUTH
-    except NotSupported as ns:
-        print(f"[!] {ns}")
-        return EXIT_NOTSUPPORTED
-    except Exception as e:
-        print(f"[!] 获取 Key 列表失败: {e}")
-        return EXIT_FAIL
-
-def cmd_key_add(args, cfg):
-    name = args.site
-    sites = cfg.get("sites", {})
-    s_cfg = sites.get(name)
-    if not s_cfg:
-        print(f"[!] 站点 {name} 未登记")
-        return EXIT_USAGE
-
-    if not args.unlimited and args.quota is None:
-        print("[!] 必须指定 --quota <额度> 或 --unlimited 之一")
-        return EXIT_USAGE
-    if args.quota is not None and args.quota <= 0:
-        print(f"[!] 额度必须为大于 0 的数值，得到: {args.quota}")
-        return EXIT_USAGE
-
-    if args.dry_run:
-        quota_desc = "无限" if args.unlimited else str(args.quota)
-        print(f"[试运行] 将在站点 {name} 创建 Key:")
-        print(f"  名称: {args.name}")
-        print(f"  分组: {args.group}")
-        print(f"  额度: {quota_desc}")
-        return EXIT_OK
-
-    adapter = get_adapter(name, s_cfg, cfg)
-    try:
-        res = adapter.create_key(
-            name=args.name,
-            group=args.group,
-            quota=args.quota,
-            unlimited=args.unlimited,
-            models=args.models.split(",") if args.models else None
-        )
-        rcache.invalidate(name, ["keys"])
-        print(f"[✓] Key 创建成功！ID: {res.get('id')}，脱敏: {res.get('key_masked')}")
-        return EXIT_OK
-    except Exception as e:
-        print(f"[!] 创建 Key 失败: {e}")
-        return EXIT_FAIL
-
-def cmd_key_set(args, cfg):
-    name = args.site
-    sites = cfg.get("sites", {})
-    s_cfg = sites.get(name)
-    if not s_cfg:
-        print(f"[!] 站点 {name} 未登记")
-        return EXIT_USAGE
-
-    if args.enable and args.disable:
-        print("[!] --enable 和 --disable 互斥，不能同时使用")
-        return EXIT_USAGE
-    if args.unlimited and args.quota is not None:
-        print("[!] --quota 和 --unlimited 互斥，不能同时使用")
-        return EXIT_USAGE
-    if args.quota is not None and args.quota <= 0:
-        print(f"[!] 额度必须为大于 0 的数值，得到: {args.quota}")
-        return EXIT_USAGE
-
-    status = None
-    if args.enable:
-        status = 1
-    elif args.disable:
-        status = 2
-
-    if args.dry_run:
-        print(f"[试运行] 将修改站点 {name} 的 Key ID: {args.id}")
-        if status: print(f"  状态: {'启用' if status == 1 else '禁用'}")
-        if args.group: print(f"  分组: {args.group}")
-        return EXIT_OK
-
-    adapter = get_adapter(name, s_cfg, cfg)
-    try:
-        res = adapter.update_key(
-            key_id=args.id,
-            status=status,
-            group=args.group,
-            quota=args.quota,
-            unlimited=args.unlimited
-        )
-        rcache.invalidate(name, ["keys"])
-        print(f"[✓] Key {args.id} 更新成功！")
-        return EXIT_OK
-    except Exception as e:
-        print(f"[!] 修改 Key 失败: {e}")
-        return EXIT_FAIL
-
-def cmd_key_rm(args, cfg):
-    name = args.site
-    sites = cfg.get("sites", {})
-    s_cfg = sites.get(name)
-    if not s_cfg:
-        print(f"[!] 站点 {name} 未登记")
-        return EXIT_USAGE
-
-    if not args.yes:
-        print(f"[!] 删除 Key 是破坏性操作。请添加 --yes 参数以确认删除 Key ID: {args.id}")
-        return EXIT_USAGE
-
-    adapter = get_adapter(name, s_cfg, cfg)
-    try:
-        adapter.delete_key(key_id=args.id)
-        rcache.invalidate(name, ["keys"])
-        print(f"[✓] 站点 {name} 的 Key ID: {args.id} 已成功删除。")
-        return EXIT_OK
-    except Exception as e:
-        print(f"[!] 删除 Key 失败: {e}")
-        return EXIT_FAIL
 
 def cmd_probe(args, cfg):
-    target = args.site
     sites = cfg.get("sites", {})
-    
+    target = args.site
     if target == "all":
         check_list = list(sites.keys())
     else:
-        if target not in sites:
-            print(f"[!] 站点 {target} 未登记")
-            return EXIT_USAGE
+        _site(cfg, target)
         check_list = [target]
 
-    headers = ["站点", "识别系统", "版本", "鉴权状态", "配额底数", "计费币种"]
+    headers = ["站点", "识别系统", "版本", "鉴权状态", "配额底数", "计费币种", "诊断"]
     rows = []
-
     for name in check_list:
         s_cfg = sites[name]
-        adapter = get_adapter(name, s_cfg, cfg)
         try:
+            adapter = get_adapter(name, s_cfg, cfg)
             p = adapter.probe()
             auth_str = "有效" if p.get("auth_ok") else f"失效 ({p.get('auth_status')})"
             rows.append([
@@ -342,92 +158,381 @@ def cmd_probe(args, cfg):
                 p.get("version", "未知"),
                 auth_str,
                 str(p.get("quota_per_unit", "-")),
-                p.get("quota_display_type", "-")
+                p.get("quota_display_type", "-"),
+                p.get("auth_msg") or p.get("auth_error") or p.get("status_error") or "",
             ])
+        except NotSupported as ns:
+            rows.append([name, "已搁置", "-", "-", "-", "-", str(ns)])
         except Exception as e:
-            rows.append([name, "探测异常", "-", str(e), "-", "-"])
+            rows.append([name, "探测异常", "-", str(e), "-", "-", str(e)])
 
     print_table(headers, rows)
     return EXIT_OK
 
-def cmd_site_list(args, cfg):
-    sites = cfg.get("sites", {})
-    headers = ["站点名称", "级别 (Tier)", "适配器 (Adapter)", "Base URL"]
+
+def cmd_groups(args, cfg):
+    s_cfg = _site(cfg, args.site)
+    adapter = get_adapter(args.site, s_cfg, cfg)
+    g_list, meta = rcache.fetch(args.site, "groups", adapter.groups, rcache.mode_from_args(args))
+    if meta.get("from_cache"):
+        print(cache_note(meta))
+    headers = ["分组名称", "说明", "倍率"]
+    rows = [[g.get("name", ""), g.get("desc", ""), str(g.get("ratio", ""))] for g in g_list]
+    print_table(headers, rows)
+    return EXIT_OK
+
+
+def cmd_keys(args, cfg):
+    s_cfg = _site(cfg, args.site)
+    adapter = get_adapter(args.site, s_cfg, cfg)
+    k_list, meta = rcache.fetch(args.site, "keys", adapter.list_keys, rcache.mode_from_args(args))
+    if meta.get("from_cache"):
+        print(cache_note(meta))
+    headers = ["ID", "名称", "分组", "状态", "无限", "剩余额度", "已用额度", "模型", "Key (脱敏)"]
     rows = []
-    for name, s_cfg in sites.items():
+    for k in k_list:
         rows.append([
-            name,
-            s_cfg.get("tier", "parked"),
-            s_cfg.get("adapter", "newapi"),
-            s_cfg.get("base", "")
+            str(k.get("id", "")),
+            k.get("name", ""),
+            k.get("group", ""),
+            "启用" if k.get("enabled") else "禁用",
+            "是" if k.get("unlimited") else "否",
+            str(k.get("remain", "")),
+            str(k.get("used", "")),
+            ",".join(k.get("models") or []),
+            k.get("key_masked", ""),
         ])
     print_table(headers, rows)
     return EXIT_OK
 
-def cmd_site_auth(args, cfg):
-    name = args.site
-    sites = cfg.get("sites", {})
-    s_cfg = sites.get(name)
-    if not s_cfg:
-        print(f"[!] 站点 {name} 未在 sites.yaml 登记")
-        return EXIT_USAGE
 
+def cmd_key_add(args, cfg):
+    s_cfg = _site(cfg, args.site)
+
+    if not args.unlimited and args.quota is None:
+        raise ConfigError("必须指定 --quota <额度> 或 --unlimited 之一")
+    if args.quota is not None and args.quota <= 0:
+        raise ConfigError(f"额度必须为大于 0 的数值，得到: {args.quota}")
+
+    if args.dry_run:
+        quota_desc = "无限" if args.unlimited else str(args.quota)
+        print(f"[试运行] 将在站点 {args.site} 创建 Key:")
+        print(f"  名称: {args.name}")
+        print(f"  分组: {args.group}")
+        print(f"  额度: {quota_desc}")
+        print(f"  模型: {args.models or '（不限）'}")
+        return EXIT_OK
+
+    adapter = get_adapter(args.site, s_cfg, cfg)
+    res = adapter.create_key(
+        name=args.name,
+        group=args.group,
+        quota=args.quota,
+        unlimited=args.unlimited,
+        models=args.models.split(",") if args.models else None,
+    )
+    rcache.invalidate(args.site, "keys")
+    # 只输出脱敏 Key：明文绝不在 CLI 透出
+    print(f"[✓] Key 创建成功！ID: {res.get('id')}，脱敏: {res.get('key_masked')}")
+    return EXIT_OK
+
+
+def cmd_key_set(args, cfg):
+    s_cfg = _site(cfg, args.site)
+
+    if args.enable and args.disable:
+        raise ConfigError("--enable 和 --disable 互斥，不能同时使用")
+    if args.unlimited and args.quota is not None:
+        raise ConfigError("--quota 和 --unlimited 互斥，不能同时使用")
+    if args.quota is not None and args.quota <= 0:
+        raise ConfigError(f"额度必须为大于 0 的数值，得到: {args.quota}")
+
+    status = 1 if args.enable else (2 if args.disable else None)
+
+    if args.dry_run:
+        print(f"[试运行] 将修改站点 {args.site} 的 Key ID: {args.id}")
+        if status:
+            print(f"  状态: {'启用' if status == 1 else '禁用'}")
+        if args.group:
+            print(f"  分组: {args.group}")
+        return EXIT_OK
+
+    adapter = get_adapter(args.site, s_cfg, cfg)
+    adapter.update_key(
+        key_id=args.id,
+        status=status,
+        group=args.group,
+        quota=args.quota,
+        unlimited=args.unlimited,
+    )
+    rcache.invalidate(args.site, "keys")
+    print(f"[✓] Key {args.id} 更新成功！")
+    return EXIT_OK
+
+
+def cmd_key_rm(args, cfg):
+    s_cfg = _site(cfg, args.site)
+    if not args.yes:
+        raise ConfigError(f"删除 Key 是破坏性操作。请添加 --yes 参数以确认删除 Key ID: {args.id}")
+    adapter = get_adapter(args.site, s_cfg, cfg)
+    adapter.delete_key(key_id=args.id)
+    rcache.invalidate(args.site, "keys")
+    print(f"[✓] 站点 {args.site} 的 Key ID: {args.id} 已成功删除。")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# 站点管理
+# ---------------------------------------------------------------------------
+def cmd_site_list(args, cfg):
+    sites = cfg.get("sites", {})
+    if getattr(args, "json", False):
+        print(json.dumps(
+            {name: rconfig.strip_internal(s) for name, s in sites.items()},
+            ensure_ascii=False, indent=2))
+        return EXIT_OK
+    headers = ["站点名称", "状态", "适配器", "面板", "Base URL", "标签"]
+    rows = []
+    for name, s_cfg in sites.items():
+        rows.append([
+            name,
+            s_cfg.get("status", "parked"),
+            s_cfg.get("adapter", "newapi"),
+            s_cfg.get("panel", ""),
+            s_cfg.get("base", ""),
+            ",".join(s_cfg.get("tags") or []),
+        ])
+    print_table(headers, rows)
+    return EXIT_OK
+
+
+def cmd_site_show(args, cfg):
+    s_cfg = _site(cfg, args.site)
+    if getattr(args, "json", False):
+        print(json.dumps(rconfig.strip_internal(s_cfg), ensure_ascii=False, indent=2))
+    else:
+        print(rconfig.dump_site_yaml(s_cfg).rstrip())
+    return EXIT_OK
+
+
+def _load_json_arg(raw: str, what: str) -> dict:
+    candidate = raw.strip()
+    if not candidate:
+        return {}
+    if os.path.exists(candidate):
+        with open(candidate, "r", encoding="utf-8") as f:
+            candidate = f.read()
+    try:
+        data = json.loads(candidate)
+    except ValueError as e:
+        raise ConfigError(f"{what} 不是合法 JSON: {e}")
+    if not isinstance(data, dict):
+        raise ConfigError(f"{what} 必须是 JSON 对象")
+    return data
+
+
+def _docs_from_args(args, base: Optional[dict] = None) -> dict:
+    docs = dict(base or {})
+    for field, value in (
+        ("login_method", getattr(args, "login_method", None)),
+        ("token_howto", getattr(args, "token_howto", None)),
+        ("script_howto", getattr(args, "script_howto", None)),
+        ("notes", getattr(args, "notes", None)),
+    ):
+        if value is not None:
+            docs[field] = value
+    return {**rconfig.DEFAULT_DOCS, **{k: v for k, v in docs.items() if k in rconfig.DEFAULT_DOCS}}
+
+
+def _auth_from_args(args, base: Optional[dict] = None) -> dict:
+    auth = dict(base or {})
+    for field, value in (
+        ("type", getattr(args, "auth_type", None)),
+        ("access_token", getattr(args, "token", None)),
+        ("access_token_env", getattr(args, "token_env", None)),
+        ("user_id", getattr(args, "user_id", None)),
+        ("username", getattr(args, "username", None)),
+        ("password", getattr(args, "password", None)),
+        ("password_env", getattr(args, "password_env", None)),
+        ("cookie", getattr(args, "cookie", None)),
+    ):
+        if value is not None:
+            auth[field] = value
+    return {**rconfig.DEFAULT_AUTH, **{k: v for k, v in auth.items() if k in rconfig.DEFAULT_AUTH}}
+
+
+def _tags_from_args(args, data: dict):
+    raw = getattr(args, "tags", None)
+    if raw is None:
+        return
+    data["tags"] = [t.strip() for t in str(raw).split(",") if t.strip()]
+
+
+def cmd_site_add(args, cfg):
+    data = _load_json_arg(args.from_json, "--from-json") if args.from_json else {}
+
+    for field, value in (
+        ("name", args.name),
+        ("base", args.base),
+        ("console_url", args.console_url),
+        ("panel", args.panel),
+        ("adapter", args.adapter),
+        ("script", args.script),
+        ("proxy", args.proxy),
+        ("refresh_interval", args.refresh_interval),
+        ("status", args.status),
+        ("parked_reason", args.parked_reason),
+    ):
+        if value is not None:
+            data[field] = value
+
+    data["docs"] = _docs_from_args(args, data.get("docs"))
+    data["auth"] = _auth_from_args(args, data.get("auth"))
+    _tags_from_args(args, data)
+
+    name = data.get("name")
+    if not name:
+        raise ConfigError("缺少站点名，请用 --name 指定（或在 --from-json 中提供 name）")
+    if not data.get("base"):
+        raise ConfigError("缺少 base，请用 --base 指定站点 API 地址")
+
+    site = {**rconfig.SITE_DEFAULTS, **data}
+    site["name"] = name
+    path = rconfig.save_site(name, site)
+    print(f"[✓] 站点 {name} 已写入: {path}")
+    for w in rconfig.site_warnings(site):
+        print(f"    提示: {w}")
+    return EXIT_OK
+
+
+def cmd_site_set(args, cfg):
+    s_cfg = _site(cfg, args.site)
+    data = dict(s_cfg)
+
+    for field, value in (
+        ("base", args.base),
+        ("console_url", args.console_url),
+        ("panel", args.panel),
+        ("adapter", args.adapter),
+        ("script", args.script),
+        ("proxy", args.proxy),
+        ("refresh_interval", args.refresh_interval),
+        ("status", args.status),
+        ("parked_reason", args.parked_reason),
+    ):
+        if value is not None:
+            data[field] = value
+
+    if args.drop_script:
+        data["script"] = None
+
+    data["docs"] = _docs_from_args(args, data.get("docs"))
+    data["auth"] = _auth_from_args(args, data.get("auth"))
+    _tags_from_args(args, data)
+
+    for item in (args.set or []):
+        if "=" not in item:
+            raise ConfigError(f"--set 需要 key=value 形式，得到: {item}")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if key not in rconfig.SITE_FIELDS:
+            raise ConfigError(f"不允许设置的字段: {key}（可选 {', '.join(rconfig.SITE_FIELDS)}）")
+        if key in ("auth", "docs", "tags"):
+            raise ConfigError(f"{key} 请使用专用参数修改")
+        data[key] = value
+
+    data["name"] = args.site
+    path = rconfig.save_site(args.site, data)
+    rcache.invalidate(args.site)
+    print(f"[✓] 站点 {args.site} 已更新: {path}")
+    return EXIT_OK
+
+
+def cmd_site_rm(args, cfg):
+    if args.site not in cfg.get("sites", {}):
+        raise ConfigError(f"站点 {args.site} 未登记")
+    if not args.yes:
+        raise ConfigError(f"删除配置是破坏性操作。请添加 --yes 确认删除站点 {args.site}")
+    deleted = rconfig.delete_site(args.site)
+    rcache.invalidate(args.site)
+    print(f"[✓] 站点 {args.site} 已成功移除。" if deleted else f"[!] 站点 {args.site} 配置文件不存在。")
+    return EXIT_OK
+
+
+def cmd_site_auth(args, cfg):
+    s_cfg = _site(cfg, args.site)
     base_url = s_cfg.get("base", "")
-    print(f"[*] 正在为站点 {name} ({base_url}) 录入凭据...")
+    print(f"[*] 正在为站点 {args.site} ({base_url}) 录入凭据...")
     token = getpass.getpass("请输入长期系统访问令牌 (System Access Token): ").strip()
     if not token:
-        print("[!] 访问令牌不能为空")
-        return EXIT_USAGE
+        raise ConfigError("访问令牌不能为空")
 
     uid_str = input("请输入该站点的 User ID (UID，纯数字，可留空): ").strip()
     uid = int(uid_str) if uid_str.isdigit() else None
 
-    s_cfg.setdefault("auth", {})
-    s_cfg["auth"]["access_token"] = token
-    s_cfg["auth"]["user_id"] = uid
+    auth = dict(s_cfg.get("auth") or {})
+    auth["access_token"] = token
+    auth["user_id"] = uid
+    data = dict(s_cfg)
+    data["auth"] = {**rconfig.DEFAULT_AUTH, **auth}
 
-    adapter = get_adapter(name, s_cfg, cfg)
+    adapter = get_adapter(args.site, data, cfg)
     print("[*] 正在验证凭据有效性...")
     p = adapter.probe()
     if p.get("auth_ok"):
-        s_cfg["tier"] = "api"
-        s_cfg["parked_reason"] = None
-        save_config(cfg)
-        rcache.invalidate(name)
-        print(f"[✓] 鉴权成功！站点 {name} 已晋级为 api 级别！")
+        data["status"] = rconfig.STATUS_ACTIVE
+        data["parked_reason"] = ""
+        rconfig.save_site(args.site, data)
+        rcache.invalidate(args.site)
+        print(f"[✓] 鉴权成功！站点 {args.site} 已标记为 active。")
         return EXIT_OK
-    else:
-        print(f"[!] 鉴权未通过: HTTP {p.get('auth_status')}")
-        return EXIT_AUTH
+    raise AuthError(f"鉴权未通过: HTTP {p.get('auth_status')}")
 
-def cmd_site_rm(args, cfg):
-    name = args.site
-    sites = cfg.get("sites", {})
-    if name not in sites:
-        print(f"[!] 站点 {name} 未登记")
-        return EXIT_USAGE
-    if not args.yes:
-        print(f"[!] 删除配置是破坏性操作。请添加 --yes 确认删除站点 {name}")
-        return EXIT_USAGE
-    del sites[name]
-    save_config(cfg)
-    rcache.invalidate(name)
-    print(f"[✓] 站点 {name} 已成功移除。")
+
+# ---------------------------------------------------------------------------
+# 迁移
+# ---------------------------------------------------------------------------
+def cmd_migrate(args, cfg):
+    result = rmigrate.migrate(dry_run=args.dry_run)
+    for line in rmigrate.migrate_report(result):
+        print(line)
+    if result["failed"]:
+        return EXIT_FAIL
+    if args.dry_run:
+        print("（试运行未写盘；去掉 --dry-run 执行实际迁移）")
     return EXIT_OK
 
-def main():
-    parser = argparse.ArgumentParser(description="relayctl: 统一多上游 AI 中转站 Key 与余额管理的轻量级工具 (CLI + Web)")
+
+# ---------------------------------------------------------------------------
+# Web
+# ---------------------------------------------------------------------------
+def cmd_web(args, cfg):
+    from relayctl.web import run_web
+    web_cfg = cfg.get("web") or {}
+    host = args.host or web_cfg.get("host") or "127.0.0.1"
+    port = args.port or web_cfg.get("port") or 8088
+    run_web(host=host, port=port)
+    return EXIT_OK
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="relayctl",
+        description="relayctl: 统一多上游 AI 中转站 Key 与余额管理的轻量级工具 (CLI + Web)")
+    parser.add_argument("--version", action="version", version=f"relayctl {__version__}")
     subparsers = parser.add_subparsers(dest="command")
 
     # balance
     p_bal = subparsers.add_parser("balance", help="查看指定站点的额度详情")
     p_bal.add_argument("site", help="站点名称")
     p_bal.add_argument("--refresh", action="store_true", help="强制从上游重新拉取")
+    p_bal.add_argument("--cached", action="store_true", help="只读本地缓存，不发网络请求")
 
     # status
     p_stat = subparsers.add_parser("status", help="列出所有上游站点状态汇总表")
     p_stat.add_argument("--json", action="store_true", help="输出 JSON 格式")
     p_stat.add_argument("--refresh", action="store_true", help="强制从上游重新拉取")
+    p_stat.add_argument("--cached", action="store_true", help="只读本地缓存")
 
     # probe
     p_probe = subparsers.add_parser("probe", help="探测站点健康度与鉴权有效性")
@@ -437,17 +542,18 @@ def main():
     p_groups = subparsers.add_parser("groups", help="查看指定站点的可用模型分组")
     p_groups.add_argument("site", help="站点名称")
     p_groups.add_argument("--refresh", action="store_true", help="强制从上游重新拉取")
+    p_groups.add_argument("--cached", action="store_true", help="只读本地缓存")
 
     # keys
     p_keys = subparsers.add_parser("keys", help="查看指定站点的 Key 列表")
     p_keys.add_argument("site", help="站点名称")
     p_keys.add_argument("--refresh", action="store_true", help="强制从上游重新拉取")
+    p_keys.add_argument("--cached", action="store_true", help="只读本地缓存")
 
     # key
     p_key = subparsers.add_parser("key", help="Key 生命周期管理 (add / set / rm)")
     key_subs = p_key.add_subparsers(dest="subcommand")
 
-    # key add
     p_kadd = key_subs.add_parser("add", help="新建 Key")
     p_kadd.add_argument("site", help="站点名称")
     p_kadd.add_argument("--name", required=True, help="Key 名称")
@@ -457,7 +563,6 @@ def main():
     p_kadd.add_argument("--models", help="限制模型 (逗号分隔)")
     p_kadd.add_argument("--dry-run", dest="dry_run", action="store_true", help="试运行预览")
 
-    # key set
     p_kset = key_subs.add_parser("set", help="修改 Key")
     p_kset.add_argument("site", help="站点名称")
     p_kset.add_argument("id", type=int, help="Key ID")
@@ -468,69 +573,156 @@ def main():
     p_kset.add_argument("--unlimited", action="store_true", help="改为无限额度")
     p_kset.add_argument("--dry-run", dest="dry_run", action="store_true", help="试运行预览")
 
-    # key rm
     p_krm = key_subs.add_parser("rm", help="删除 Key")
     p_krm.add_argument("site", help="站点名称")
     p_krm.add_argument("id", type=int, help="Key ID")
     p_krm.add_argument("--yes", action="store_true", help="确认删除 (破坏性操作)")
 
     # site
-    p_site = subparsers.add_parser("site", help="站点配置管理")
+    p_site = subparsers.add_parser("site", help="站点配置管理 (add / show / list / set / rm / auth)")
     site_subs = p_site.add_subparsers(dest="subcommand")
-    site_subs.add_parser("list", help="列出所有配置的站点")
-    p_sauth = site_subs.add_parser("auth", help="录入长期系统访问令牌")
-    p_sauth.add_argument("site", help="站点名称")
+
+    p_slist = site_subs.add_parser("list", help="列出所有配置的站点")
+    p_slist.add_argument("--json", action="store_true", help="输出 JSON 格式")
+
+    p_sshow = site_subs.add_parser("show", help="查看单个站点配置（凭据脱敏）")
+    p_sshow.add_argument("site", help="站点名称")
+    p_sshow.add_argument("--json", action="store_true", help="输出 JSON 格式")
+
+    p_sadd = site_subs.add_parser("add", help="新增站点（非交互，写出完整 docs）")
+    _add_site_args(p_sadd)
+
+    p_sset = site_subs.add_parser("set", help="修改站点配置")
+    p_sset.add_argument("site", help="站点名称")
+    _add_site_args(p_sset)
+    p_sset.add_argument("--set", action="append", metavar="KEY=VALUE",
+                        help="直接设置顶层字段（如 --set proxy=none）")
+    p_sset.add_argument("--drop-script", action="store_true", help="清除脚本配置")
+
     p_srm = site_subs.add_parser("rm", help="删除站点配置")
     p_srm.add_argument("site", help="站点名称")
     p_srm.add_argument("--yes", action="store_true", help="确认删除")
 
+    p_sauth = site_subs.add_parser("auth", help="交互式录入长期系统访问令牌")
+    p_sauth.add_argument("site", help="站点名称")
+
+    # migrate
+    p_mig = subparsers.add_parser("migrate", help="把旧 sites.yaml 迁移为 sites/<name>.yaml")
+    p_mig.add_argument("--dry-run", dest="dry_run", action="store_true", help="只预览不写盘")
+
     # web
     p_web = subparsers.add_parser("web", help="启动双端自适应 Web 管理控制台")
-    p_web.add_argument("--host", default="0.0.0.0", help="监听地址 (默认 0.0.0.0)")
-    p_web.add_argument("--port", type=int, default=8088, help="监听端口 (默认 8088)")
+    p_web.add_argument("--host", default=None, help="监听地址 (默认 127.0.0.1)")
+    p_web.add_argument("--port", type=int, default=None, help="监听端口 (默认 8088)")
 
-    args = parser.parse_args()
+    return parser, p_key, p_site
+
+
+def _add_site_args(parser):
+    # --name 不设为 argparse required：--from-json 也可以提供 name，统一在函数内校验
+    parser.add_argument("--name", help="站点名称")
+    parser.add_argument("--base", help="站点 API 地址 (http(s)://...)")
+    parser.add_argument("--console-url", dest="console_url", help="站点控制台地址")
+    parser.add_argument("--panel", choices=["newapi", "oneapi", "custom"],
+                        help="面板类型 (newapi / oneapi / custom)")
+    parser.add_argument("--adapter", choices=["newapi", "oneapi", "script"],
+                        help="适配器标识 (newapi / oneapi / script)")
+    parser.add_argument("--script", help="adapter=script 时的脚本路径")
+    parser.add_argument("--auth-type", dest="auth_type",
+                        choices=["access_token", "cookie", "password", "none"],
+                        help="鉴权类型 (access_token/cookie/password/none)")
+    parser.add_argument("--token", help="访问令牌（明文，优先推荐 --token-env）")
+    parser.add_argument("--token-env", dest="token_env", help="从环境变量读取令牌（明文不落盘）")
+    parser.add_argument("--user-id", dest="user_id", type=int, help="User ID (UID)")
+    parser.add_argument("--username", help="密码登录用户名")
+    parser.add_argument("--password", help="密码登录密码（明文，优先推荐 --password-env）")
+    parser.add_argument("--password-env", dest="password_env", help="从环境变量读取密码")
+    parser.add_argument("--cookie", help="Cookie 登录态（明文）")
+    parser.add_argument("--login-method", dest="login_method", help="docs: 登录/进站方式")
+    parser.add_argument("--token-howto", dest="token_howto", help="docs: 长期令牌获取路径")
+    parser.add_argument("--script-howto", dest="script_howto", help="docs: 脚本使用说明")
+    parser.add_argument("--notes", help="docs: 排障备注")
+    parser.add_argument("--proxy", help="代理策略: none / auto / http://host:port")
+    parser.add_argument("--refresh-interval", dest="refresh_interval", help="刷新间隔 (如 30m)")
+    parser.add_argument("--tags", help="标签（逗号分隔）")
+    parser.add_argument("--status", choices=[rconfig.STATUS_ACTIVE, rconfig.STATUS_PARKED],
+                        help="站点状态")
+    parser.add_argument("--parked-reason", dest="parked_reason", help="搁置原因")
+    parser.add_argument("--from-json", dest="from_json",
+                        help="从 JSON 字符串或 JSON 文件读取站点配置")
+
+
+def main(argv=None):
+    parser, p_key, p_site = build_parser()
+    args = parser.parse_args(argv)
     if not args.command:
         parser.print_help()
         return EXIT_OK
 
-    cfg = load_config()
-    rc = EXIT_OK
+    try:
+        cfg = rconfig.load_config()
+    except ConfigError as e:
+        print(f"[!] 配置加载失败: {e}")
+        return EXIT_USAGE
 
-    if args.command == "balance":
-        rc = cmd_balance(args, cfg)
-    elif args.command == "status":
-        rc = cmd_status(args, cfg)
-    elif args.command == "probe":
-        rc = cmd_probe(args, cfg)
-    elif args.command == "groups":
-        rc = cmd_groups(args, cfg)
-    elif args.command == "keys":
-        rc = cmd_keys(args, cfg)
-    elif args.command == "key":
-        if args.subcommand == "add":
-            rc = cmd_key_add(args, cfg)
-        elif args.subcommand == "set":
-            rc = cmd_key_set(args, cfg)
-        elif args.subcommand == "rm":
-            rc = cmd_key_rm(args, cfg)
-        else:
+    for err in cfg.get("site_errors", []):
+        print(f"[!] 站点配置加载失败（已跳过）{err['name']}: {err['error']}", file=sys.stderr)
+
+    handlers = {
+        "balance": cmd_balance,
+        "status": cmd_status,
+        "probe": cmd_probe,
+        "groups": cmd_groups,
+        "keys": cmd_keys,
+        "migrate": cmd_migrate,
+        "web": cmd_web,
+    }
+
+    try:
+        if args.command in handlers:
+            return handlers[args.command](args, cfg)
+        if args.command == "key":
+            if args.subcommand == "add":
+                return cmd_key_add(args, cfg)
+            if args.subcommand == "set":
+                return cmd_key_set(args, cfg)
+            if args.subcommand == "rm":
+                return cmd_key_rm(args, cfg)
             p_key.print_help()
-    elif args.command == "web":
-        from relayctl.web import run_web
-        run_web(host=args.host, port=args.port)
-        return EXIT_OK
-    elif args.command == "site":
-        if args.subcommand == "list":
-            rc = cmd_site_list(args, cfg)
-        elif args.subcommand == "auth":
-            rc = cmd_site_auth(args, cfg)
-        elif args.subcommand == "rm":
-            rc = cmd_site_rm(args, cfg)
-        else:
+            return EXIT_USAGE
+        if args.command == "site":
+            if args.subcommand == "list":
+                return cmd_site_list(args, cfg)
+            if args.subcommand == "show":
+                return cmd_site_show(args, cfg)
+            if args.subcommand == "add":
+                return cmd_site_add(args, cfg)
+            if args.subcommand == "set":
+                return cmd_site_set(args, cfg)
+            if args.subcommand == "rm":
+                return cmd_site_rm(args, cfg)
+            if args.subcommand == "auth":
+                return cmd_site_auth(args, cfg)
             p_site.print_help()
+            return EXIT_USAGE
+        parser.print_help()
+        return EXIT_USAGE
+    except AuthError as e:
+        print(f"[!] 鉴权失败: {e}")
+        return EXIT_AUTH
+    except NotSupported as e:
+        print(f"[!] {e}")
+        return EXIT_NOTSUPPORTED
+    except ConfigError as e:
+        print(f"[!] 配置错误: {e}")
+        return EXIT_USAGE
+    except KeyboardInterrupt:
+        print("\n[!] 已中断")
+        return EXIT_FAIL
+    except Exception as e:
+        print(f"[!] 操作失败: {e}")
+        return EXIT_FAIL
 
-    sys.exit(rc)
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

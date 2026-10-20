@@ -9,6 +9,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 
 # 引入核心模块
+from . import models
 from .core import load_config
 from . import cache as rcache
 from .adapters import get_adapter
@@ -283,6 +284,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               <tr>
                 <th>名称</th>
                 <th>分组</th>
+                <th>状态</th>
                 <th>剩余额度</th>
                 <th>Key (脱敏)</th>
               </tr>
@@ -292,8 +294,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <tr>
                   <td><b>${k.name}</b></td>
                   <td>${k.group}</td>
-                  <td>${k.remain_quota}</td>
-                  <td><span class="key-badge">${k.key}</span></td>
+                  <td>${k.enabled ? '启用' : '禁用'}</td>
+                  <td>${k.remain}</td>
+                  <td><span class="key-badge">${k.key_masked}</span></td>
                 </tr>
               `).join('')}
             </tbody>
@@ -417,7 +420,8 @@ class RelayctlWebHandler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # 不放开跨域：默认只监听 127.0.0.1，且不再下发 Access-Control-Allow-Origin: *
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
 
@@ -466,14 +470,14 @@ class RelayctlWebHandler(BaseHTTPRequestHandler):
                     try:
                         adapter = get_adapter(s_name, s_cfg, cfg)
                         mode = rcache.MODE_REFRESH if force_refresh else rcache.MODE_AUTO
-                        bal_data = rcache.fetch(s_name, "balance", adapter.balance, mode)["data"]
+                        bal_data, _ = rcache.fetch(s_name, "balance", adapter.balance, mode)
                         info["balance"] = str(bal_data.get("balance", "-"))
                         info["used"] = str(bal_data.get("used", "-"))
                         info["group"] = bal_data.get("user_group", "-")
                         info["display_type"] = bal_data.get("display_type", "")
 
                         # Key count
-                        keys_data = rcache.fetch(s_name, "keys", adapter.list_keys, mode)["data"]
+                        keys_data, _ = rcache.fetch(s_name, "keys", adapter.list_keys, mode)
                         info["key_count"] = len(keys_data) if isinstance(keys_data, list) else "-"
                     except Exception as e:
                         info["diagnosis"] = f"读取异常: {e}"
@@ -499,7 +503,8 @@ class RelayctlWebHandler(BaseHTTPRequestHandler):
             try:
                 adapter = get_adapter(s_name, s_cfg, cfg)
                 keys_data = adapter.list_keys()
-                self._send_json({"success": True, "data": keys_data})
+                # 永不出明文：剔除 _raw_key 等内部/凭据字段
+                self._send_json({"success": True, "data": models.sanitize(keys_data)})
             except Exception as e:
                 self._send_json({"success": False, "message": str(e)}, 500)
             return
@@ -546,20 +551,24 @@ class RelayctlWebHandler(BaseHTTPRequestHandler):
                 adapter = get_adapter(s_name, sites[s_name], cfg)
                 res = adapter.create_key(name=k_name, group=k_group, quota=k_quota, unlimited=k_unlimited)
                 rcache.invalidate(s_name, "keys")
-                self._send_json({"success": True, "key_id": res.get("id"), "key": res.get("key_masked")})
+                # 只回传脱敏 Key
+                self._send_json({"success": True, "key_id": res.get("id"),
+                                 "key": res.get("key_masked")})
             except Exception as e:
                 self._send_json({"success": False, "message": str(e)}, 500)
             return
 
         self._send_json({"error": "Not Found"}, 404)
 
-def run_web(host: str = "0.0.0.0", port: int = 8088, config_override: Optional[dict] = None):
-    """启动 relayctl Web 服务"""
+def run_web(host: str = "127.0.0.1", port: int = 8088, config_override: Optional[dict] = None):
+    """启动 relayctl Web 服务（默认只监听回环地址；完整鉴权在阶段 6）。"""
     RelayctlWebHandler.config = config_override or load_config()
     server_address = (host, port)
     httpd = HTTPServer(server_address, RelayctlWebHandler)
     print(f"[*] relayctl Web 控制台已启动: http://{host}:{port}/")
     print("    支持手机浏览器 (触控适配卡片流) 与桌面浏览器 (宽屏仪表盘)")
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        print(f"[!] 警告: 当前监听 {host}，将暴露到非回环网络且尚未启用访问鉴权")
     print("    按 Ctrl+C 停止服务。")
     try:
         httpd.serve_forever()
