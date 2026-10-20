@@ -10,7 +10,7 @@ from typing import Optional
 
 # 引入核心模块
 from .core import load_config
-from .cache import rcache
+from . import cache as rcache
 from .adapters import get_adapter
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
