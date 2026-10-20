@@ -8,7 +8,7 @@ sites:
     tier: api                  # 级别: api (全自动管理) 或 parked (已搁置)
     adapter: newapi            # 适配器类型: newapi 或 oneapi
     base: https://api.example.com
-    proxy: auto                # 代理策略: auto (自动探测直连/代理), none (强制直连), 或指定 http://127.0.0.1:7890
+    proxy: auto                # 代理策略: auto (跟随系统代理环境变量), none (强制直连), 或指定 http://127.0.0.1:7890
     auth:
       access_token: "your-upstream-system-access-token"
       user_id: 12345           # New API 站点通常需要提供 UID 配合 New-Api-User 鉴权

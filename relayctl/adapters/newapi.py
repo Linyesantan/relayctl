@@ -97,7 +97,7 @@ class NewAPIAdapter(BaseAdapter):
         r = self.client.get("/api/user/self")
         self._check_auth_response(r)
         
-        # 兼容 FastAI 等 /api/v1/user/profile 定制管理端点
+        # 兼容部分魔改面板的 /api/v1/user/profile 余额端点
         if r.status_code == 404:
             r_alt = self.client.get("/api/v1/user/profile")
             self._check_auth_response(r_alt)
@@ -125,8 +125,7 @@ class NewAPIAdapter(BaseAdapter):
             # 一律不猜、不编造余额：端点不可用就明确报 NotSupported
             raise NotSupported(
                 f"无法自动读取余额：站点 {self.name} 的 /api/user/self 返回 404，"
-                f"/api/v1/user/profile 兜底也不可用。请人工登录站点控制台查看，"
-                f"或抓包确认其管理端点后再接入。"
+                f"/api/v1/user/profile 兜底也不可用。请人工登录站点控制台查看。"
             )
 
         if r.status_code != 200:
@@ -276,7 +275,7 @@ class NewAPIAdapter(BaseAdapter):
                 break
 
         if not parsed_ok:
-            # 定制端点（如 fastai）上 /api/token/ 不可用，别再静默返回空列表假装 0 个 Key
+            # 魔改面板上 /api/token/ 不可用时，别再静默返回空列表假装 0 个 Key
             raise NotSupported(
                 f"站点 {self.name} 的 Key 列表接口不可用（{last_status or '未知错误'}），无法自动统计 Key 数。"
             )
@@ -297,7 +296,7 @@ class NewAPIAdapter(BaseAdapter):
                 "remain": remain,
                 "used": used,
                 "key_masked": mask_key(key_val),
-                "_raw_key": key_val
+                "_raw_key": key_val,
             })
         return keys
 
@@ -462,54 +461,3 @@ class NewAPIAdapter(BaseAdapter):
         if not d.get("success"):
             raise Exception(d.get("message", "删除 Key 失败"))
         return True
-
-    def reveal_key(self, key_id: int) -> str:
-        """提取明文 Key，绝不允许任何含 * 的打码 Key 通过"""
-        # 1. POST /api/token/:id/key
-        try:
-            r = self.client.post(f"/api/token/{key_id}/key")
-            self._check_auth_response(r)
-            if r.status_code == 200:
-                d = r.json()
-                self._check_auth_response(r, d)
-                if d.get("success"):
-                    k = d.get("data")
-                    if isinstance(k, dict):
-                        k = k.get("key")
-                    if k and isinstance(k, str) and "*" not in k:
-                        return k
-        except AuthError:
-            raise
-        except Exception:
-            pass
-
-        # 2. GET /api/token/:id
-        try:
-            r = self.client.get(f"/api/token/{key_id}")
-            self._check_auth_response(r)
-            if r.status_code == 200:
-                d = r.json()
-                self._check_auth_response(r, d)
-                if d.get("success"):
-                    k = d.get("data", {}).get("key")
-                    if k and isinstance(k, str) and "*" not in k:
-                        return k
-        except AuthError:
-            raise
-        except Exception:
-            pass
-
-        # 3. 尝试从列表拿
-        try:
-            keys = self.list_keys()
-            for item in keys:
-                if item["id"] == key_id:
-                    raw = item.get("_raw_key")
-                    if raw and "*" not in raw:
-                        return raw
-        except AuthError:
-            raise
-        except Exception:
-            pass
-                    
-        raise NotSupported(f"站点 {self.name} 前端打码且未开放明文提取接口，禁止打码 Key 流入同步！请人工在站点复制后同步。")

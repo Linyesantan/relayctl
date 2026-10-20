@@ -40,16 +40,12 @@ class BaseAdapter:
         """删除 Key"""
         raise NotImplementedError
 
-    def reveal_key(self, key_id: int) -> str:
-        """获取 Key 明文（只用于同步至本地，禁止直接命令行打印）"""
-        raise NotSupported(f"站点 {self.name} 暂不支持明文密钥提取")
-
 class ParkedAdapter(BaseAdapter):
     """搁置（Parked）站点适配器：记录原因与升级 TODO"""
     def __init__(self, name: str, site_cfg: dict, core_cfg: dict):
         super().__init__(name, site_cfg, core_cfg)
         self.reason = site_cfg.get("parked_reason") or "凭据缺失或接口未探明"
-        self.todo = site_cfg.get("todo") or "在 Chrome 登录后抓取凭据或配置系统令牌"
+        self.todo = site_cfg.get("todo") or "在站点个人设置中生成系统访问令牌后执行 relayctl site auth"
 
     def _parked_resp(self):
         return {
@@ -79,6 +75,3 @@ class ParkedAdapter(BaseAdapter):
 
     def delete_key(self, key_id: int) -> bool:
         return False
-
-    def reveal_key(self, key_id: int) -> str:
-        raise NotSupported(f"站点 {self.name} 处于 parked 状态: {self.reason}")

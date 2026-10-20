@@ -72,7 +72,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     .badge { font-size: 11px; padding: 2px 8px; border-radius: 12px; font-weight: 600; text-transform: uppercase; }
     .badge-api { background: rgba(52, 211, 153, 0.15); color: var(--success); border: 1px solid rgba(52, 211, 153, 0.3); }
     .badge-parked { background: rgba(251, 191, 36, 0.15); color: var(--warning); border: 1px solid rgba(251, 191, 36, 0.3); }
-    .badge-script { background: rgba(129, 140, 248, 0.15); color: #818cf8; border: 1px solid rgba(129, 140, 248, 0.3); }
     
     .card-body { font-size: 13px; margin-bottom: 14px; line-height: 1.6; }
     .info-row { display: flex; justify-content: space-between; margin-bottom: 4px; }
@@ -115,7 +114,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="brand-icon">R</div>
         <div>
           <div class="brand-title">relayctl 控制台</div>
-          <div class="brand-subtitle">上游中转统一管理与本地网关同步</div>
+          <div class="brand-subtitle">多上游中转站 Key 与余额统一管理</div>
         </div>
       </div>
       <div class="actions">

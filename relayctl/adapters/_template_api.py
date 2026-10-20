@@ -42,6 +42,3 @@ class CustomApiAdapter(BaseAdapter):
 
     def update_key(self, key_id: int, group: str = None, status: int = None, quota: float = None, name: str = None) -> dict:
         raise NotSupported("更新 Key 暂未实现")
-
-    def reveal_key(self, key_id: int) -> str:
-        raise NotSupported("明文提取暂未实现")

@@ -121,14 +121,16 @@ class HttpClient:
         self.auth = auth or {}
         self.session = _SafeSession()
         
-        if self.proxy:
-            self.session.proxies = {
-                "http": self.proxy,
-                "https": self.proxy
-            }
-        else:
-            # 默认直连防止被系统代理干扰
+        mode = (self.proxy or "none").strip() if isinstance(self.proxy, str) else "none"
+        if mode.lower() == "auto":
+            # auto: 跟随系统环境变量代理（HTTP(S)_PROXY / ALL_PROXY），未设置则直连
+            self.session.trust_env = True
+        elif mode.lower() in ("none", "direct", ""):
+            # 强制直连，避免被系统代理干扰
             self.session.trust_env = False
+        else:
+            self.session.trust_env = False
+            self.session.proxies = {"http": mode, "https": mode}
 
     def get_headers(self, custom_headers: Optional[dict] = None) -> dict:
         headers = {
