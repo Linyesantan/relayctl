@@ -215,7 +215,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               <div class="card-head">
                 <div class="site-name">
                   ${s.name}
-                  <span style="font-size: 11px; color: var(--text-muted); font-weight: normal;">(CH: ${s.channel || '-'})</span>
                 </div>
                 <span class="badge badge-${s.tier}">${s.tier}</span>
               </div>
@@ -452,13 +451,10 @@ class RelayctlWebHandler(BaseHTTPRequestHandler):
             def process_site(item):
                 s_name, s_cfg = item
                 tier = s_cfg.get("tier", "parked")
-                ch = s_cfg.get("local_channel")
-                channel_str = ",".join(map(str, ch)) if isinstance(ch, list) else (str(ch) if ch else "-")
                 
                 info = {
                     "name": s_name,
                     "tier": tier,
-                    "channel": channel_str,
                     "balance": "-",
                     "used": "-",
                     "group": "-",

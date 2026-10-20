@@ -1,58 +1,29 @@
-local:
-  base: http://127.0.0.1:3001
-  access_token: "your-local-root-system-access-token"
-  user_id: 1
-  # 渠道 key 不通过 API 返回，同步前备份与失败回滚都以只读方式从这里读明文 key。
-  # db_path 直读；若卷目录权限不足（常见 root:700），自动退回 docker exec 取快照。
-  db_path: /var/lib/docker/volumes/new-api_new-api-data/_data/one-api.db
-  db_container: new-api
-  db_container_path: /data/one-api.db
+# relayctl 配置文件示例
+# 默认路径: ~/.config/relayctl/sites.yaml (建议锁定权限为 600: chmod 600 sites.yaml)
 
 sites:
-  kuaipao:
+  # 标准 New API 站点示例 (最常见)
+  # 凭据获取方式: 登录站点后台 -> 个人设置 -> 生成「系统访问令牌」
+  mysite-newapi:
+    tier: api                  # 级别: api (全自动管理) 或 parked (已搁置)
+    adapter: newapi            # 适配器类型: newapi 或 oneapi
+    base: https://api.example.com
+    proxy: auto                # 代理策略: auto (自动探测直连/代理), none (强制直连), 或指定 http://127.0.0.1:7890
+    auth:
+      access_token: "your-upstream-system-access-token"
+      user_id: 12345           # New API 站点通常需要提供 UID 配合 New-Api-User 鉴权
+
+  # 传统 One API 站点示例
+  mysite-oneapi:
     tier: api
-    adapter: newapi
-    base: https://kuaipao.ai
-    proxy: http://127.0.0.1:7890
+    adapter: oneapi
+    base: https://oneapi.example.com
+    proxy: none
     auth:
-      access_token: "upstream-system-access-token"
-      user_id: 12345
-    local_channel: 1
-    currency:
-      display: CUSTOM
-      rate: null
-    low_balance: 5.0
-    parked_reason: null
-    todo: null
+      access_token: "your-upstream-system-access-token"
 
-  wusrouter:
-    tier: script
-    adapter: wusrouter
-    base: https://wusrouter.com
-    proxy: http://127.0.0.1:7890
-    auth:
-      access_token: ""
-      user_id: null
-    local_channel: 4
-    currency:
-      display: USD
-      rate: null
-    low_balance: null
-    parked_reason: null
-    todo: null
-
-  aiapi.bot:
+  # 暂无凭据或搁置站点示例
+  mysite-parked:
     tier: parked
-    adapter: newapi
-    base: https://cn.aiapi.bot
-    proxy: http://127.0.0.1:7890
-    auth:
-      access_token: ""
-      user_id: null
-    local_channel: 8
-    currency:
-      display: CNY
-      rate: null
-    low_balance: null
-    parked_reason: "无登录态，管理接口未知（常见路径 404，/docs 为 SPA）"
-    todo: "在 Chrome 登录 cn.aiapi.bot 后抓包，判断升为 api 或 script"
+    base: https://parked.example.com
+    parked_reason: "等待在个人设置中生成长期系统访问令牌"

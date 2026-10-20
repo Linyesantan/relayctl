@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+"""
+relayctl: 统一多上游 AI 中转站 Key 与余额管理的轻量级工具 (CLI + Web)
+"""
+
 import sys
 import os
 import argparse
@@ -16,51 +20,14 @@ if parent_dir not in sys.path:
 from relayctl.core import load_config, save_config, print_table, mask_key, HttpClient, AuthError
 from relayctl.adapters import get_adapter
 from relayctl.adapters.base import ParkedAdapter, NotSupported
-from relayctl.sync import LocalChannelSyncer, ChannelMismatch, TestModelMissing
-from relayctl.browser_sync import run_managed_browser_sync
-from relayctl.check_parked import run_parked_check
 from relayctl import cache as rcache
 
-# 退出码：脚本与定时任务据此判断成败，不再一律 0
+# 退出码
 EXIT_OK = 0             # 成功
 EXIT_FAIL = 1           # 一般失败
 EXIT_AUTH = 2           # 鉴权失败（401 / AUTH_*）
 EXIT_NOTSUPPORTED = 3   # 站点或适配器不支持该操作
-EXIT_USAGE = 4          # 参数或配置问题（站点未登记、parked、额度不合法、渠道不属于该站点等）
-EXIT_SYNC_FAILED = 5    # 同步未生效：新 Key 未落库，或连通性测试未通过
-EXIT_ROLLBACK_FAILED = 6  # 回滚未完成，或回滚后回读校验不一致
-
-def update_site_doc_section(site_name: str, tier: str, reason: Optional[str] = None, todo: Optional[str] = None):
-    doc_path = os.path.join(parent_dir, "docs", "sites.md")
-    if not os.path.exists(doc_path):
-        return
-    try:
-        with open(doc_path, "r", encoding="utf-8") as f:
-            content = f.read()
-
-        # 匹配 ## <site_name> 或 ## <数字>. <site_name> 章节
-        pattern = re.compile(rf"(##\s+(\d+\.\s*)?{re.escape(site_name)}\b[\s\S]*?)(?=\n##|\Z)", re.MULTILINE)
-        m = pattern.search(content)
-        if m:
-            sec = m.group(1)
-            # 替换状态级别
-            sec = re.sub(r"-\s+\*\*当前状态\*\*:\s*`[^`]+`", f"- **当前状态**: `{tier}`", sec)
-            if tier == "parked":
-                if reason:
-                    if "- **当前受限原因**:" in sec:
-                        sec = re.sub(r"-\s+\*\*当前受限原因\*\*:[^\n]+", f"- **当前受限原因**: {reason}", sec)
-                    else:
-                        sec += f"\n- **当前受限原因**: {reason}"
-                if todo:
-                    if "- **晋级/恢复条件**:" in sec:
-                        sec = re.sub(r"-\s+\*\*晋级/恢复条件\*\*:[^\n]+", f"- **晋级/恢复条件**: {todo}", sec)
-                    else:
-                        sec += f"\n- **晋级/恢复条件**: {todo}"
-            content = content[:m.start(1)] + sec + content[m.end(1):]
-            with open(doc_path, "w", encoding="utf-8") as f:
-                f.write(content)
-    except Exception:
-        pass
+EXIT_USAGE = 4          # 参数或配置问题
 
 def cache_note(meta) -> str:
     """标注数据的最新更新时间。"""
@@ -69,11 +36,6 @@ def cache_note(meta) -> str:
     if meta.get("from_cache"):
         return f"最新更新时间: {meta.get('fetched_at')}（缓存，{rcache.age_text(meta['ts'])}；--refresh 重新拉取）"
     return f"最新更新时间: {meta.get('fetched_at')}（刚刚实时拉取）"
-
-def format_channels(ch) -> str:
-    if isinstance(ch, list):
-        return ",".join(str(x) for x in ch)
-    return str(ch) if ch is not None else "-"
 
 def cmd_balance(args, cfg):
     name = args.site
@@ -105,7 +67,6 @@ def cmd_balance(args, cfg):
 
 def cmd_status(args, cfg):
     sites = cfg.get("sites", {})
-    config_changed = False
     c_mode = rcache.mode_from_args(args)
     
     if args.json:
@@ -113,165 +74,92 @@ def cmd_status(args, cfg):
         for name, s_cfg in sites.items():
             adapter = get_adapter(name, s_cfg, cfg)
             tier = s_cfg.get("tier", "parked")
-            ch_info = s_cfg.get("local_channel")
             if tier == "parked":
                 result[name] = {
                     "tier": "parked",
-                    "reason": s_cfg.get("parked_reason"),
-                    "todo": s_cfg.get("todo"),
-                    "local_channel": ch_info
+                    "reason": s_cfg.get("parked_reason")
                 }
             else:
                 try:
                     b, b_meta = rcache.fetch(name, "balance", adapter.balance, c_mode)
                     key_count = None
                     keys_error = None
-                    k_meta = None
                     try:
-                        keys, k_meta = rcache.fetch(name, "keys", adapter.list_keys, c_mode)
+                        keys, _ = rcache.fetch(name, "keys", adapter.list_keys, c_mode)
                         key_count = len(keys)
-                    except AuthError:
-                        raise
                     except Exception as e:
                         keys_error = str(e)
                     result[name] = {
                         "tier": tier,
                         "balance": b.get("balance"),
                         "used": b.get("used"),
-                        "raw_quota": b.get("raw_quota"),
-                        "raw_used": b.get("raw_used"),
                         "quota_per_unit": b.get("quota_per_unit"),
                         "display_type": b.get("display_type"),
                         "group": b.get("user_group"),
                         "key_count": key_count,
                         "keys_error": keys_error,
-                        "local_channel": ch_info,
-                        "from_cache": b_meta["from_cache"],
-                        "updated_at": b_meta["fetched_at"],
-                        "keys_updated_at": (k_meta or {}).get("fetched_at")
+                        "from_cache": b_meta["from_cache"]
                     }
                 except AuthError as ae:
-                    # 遇到 AuthError，写回 tier=parked
-                    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-                    reason = f"鉴权失效 ({now_str})"
-                    todo = f"relayctl site auth {name}"
-                    s_cfg["tier"] = "parked"
-                    s_cfg["parked_reason"] = reason
-                    s_cfg["todo"] = todo
-                    config_changed = True
-                    rcache.invalidate(name)
-                    update_site_doc_section(name, "parked", reason, todo)
-                    result[name] = {
-                        "tier": "parked",
-                        "auth_failed": True,
-                        "reason": reason,
-                        "todo": todo,
-                        "local_channel": ch_info
-                    }
+                    result[name] = {"tier": tier, "error": f"鉴权失败: {ae}"}
                 except Exception as e:
-                    result[name] = {
-                        "tier": tier,
-                        "error": str(e),
-                        "local_channel": ch_info
-                    }
-        if config_changed:
-            save_config(cfg)
+                    result[name] = {"tier": tier, "error": str(e)}
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return EXIT_OK
 
-    headers = ["站点", "级别", "渠道ID", "余额 / 配额", "已用", "用户分组", "Key数", "站点标注", "最新更新时间", "状态 / 诊断详情"]
+    headers = ["站点", "级别", "余额 / 配额", "已用", "用户分组", "Key数", "站点标注", "状态 / 诊断详情"]
     rows = []
-    
+
     for name, s_cfg in sites.items():
-        tier = s_cfg.get("tier", "parked")
-        ch_str = format_channels(s_cfg.get("local_channel"))
         adapter = get_adapter(name, s_cfg, cfg)
-        
+        tier = s_cfg.get("tier", "parked")
+
         if tier == "parked":
-            reason = s_cfg.get("parked_reason") or "未配置有效长期凭据"
-            rows.append([name, "parked", ch_str, "-", "-", "-", "-", "-", "-", reason])
+            rows.append([
+                name, tier, "-", "-", "-", "-", "-",
+                s_cfg.get("parked_reason") or "缺少凭据"
+            ])
         else:
             try:
-                b, b_meta = rcache.fetch(name, "balance", adapter.balance, c_mode)
-                keys = None
-                keys_err = None
+                b, _ = rcache.fetch(name, "balance", adapter.balance, c_mode)
+                bal = str(b.get("balance", "-"))
+                used = str(b.get("used", "-"))
+                group = b.get("user_group", "-")
+                display_type = b.get("display_type", "")
+                
                 try:
-                    keys, _k_meta = rcache.fetch(name, "keys", adapter.list_keys, c_mode)
-                except AuthError:
-                    raise
-                except Exception as e:
-                    # 定制端点上 list_keys 常失败，之前被吞掉后显示 0，误以为「没有 Key」
-                    keys_err = str(e)
-                rows.append([
-                    name,
-                    tier,
-                    ch_str,
-                    b.get("balance", "-"),
-                    b.get("used", "-"),
-                    b.get("user_group", "default"),
-                    "-" if keys is None else str(len(keys)),
-                    b.get("display_type", "-"),
-                    b_meta["fetched_at"],
-                    ("正常活跃" if keys_err is None else f"正常活跃（Key 数未知: {keys_err[:36]}）")
-                ])
+                    keys, _ = rcache.fetch(name, "keys", adapter.list_keys, c_mode)
+                    k_count = str(len(keys))
+                except Exception:
+                    k_count = "获取失败"
+
+                rows.append([name, tier, bal, used, group, k_count, display_type, "正常活跃"])
             except AuthError as ae:
-                # 遇到 AuthError，写回 tier=parked
-                now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-                reason = f"鉴权失效 ({now_str})"
-                todo = f"relayctl site auth {name}"
-                s_cfg["tier"] = "parked"
-                s_cfg["parked_reason"] = reason
-                s_cfg["todo"] = todo
-                config_changed = True
-                rcache.invalidate(name)
-                update_site_doc_section(name, "parked", reason, todo)
-                rows.append([name, "parked", ch_str, "-", "-", "-", "-", "-", "-", f"鉴权失效 (已降级为 parked，待执行 {todo})"])
+                rows.append([name, tier, "-", "-", "-", "-", "-", f"鉴权失效 ({ae})"])
+            except NotSupported as ns:
+                rows.append([name, tier, "-", "-", "-", "-", "-", str(ns)])
             except Exception as e:
-                rows.append([name, tier, ch_str, "错误", "-", "-", "-", "-", "-", str(e)[:44]])
+                rows.append([name, tier, "-", "-", "-", "-", "-", f"异常: {e}"])
 
-    if config_changed:
-        save_config(cfg)
     print_table(headers, rows)
-    return EXIT_OK
-
-def cmd_probe(args, cfg):
-    target = args.site
-    sites = cfg.get("sites", {})
-    to_probe = sites.keys() if target == "all" else [target]
-    
-    for name in to_probe:
-        s_cfg = sites.get(name)
-        if not s_cfg:
-            print(f"[!] 站点 {name} 不存在")
-            continue
-        print(f"\n>>> 探测站点: {name} ({s_cfg.get('base')})")
-        adapter = get_adapter(name, s_cfg, cfg)
-        try:
-            res = adapter.probe()
-            if s_cfg.get("tier") != "parked":
-                rcache.write(name, "probe", res)
-            print(json.dumps(res, ensure_ascii=False, indent=2))
-        except Exception as e:
-            print(f"[!] 探测失败: {e}")
-            return EXIT_FAIL
     return EXIT_OK
 
 def cmd_groups(args, cfg):
     name = args.site
-    s_cfg = cfg.get("sites", {}).get(name)
+    sites = cfg.get("sites", {})
+    s_cfg = sites.get(name)
     if not s_cfg:
         print(f"[!] 站点 {name} 未登记")
-        return EXIT_USAGE
-    if s_cfg.get("tier") == "parked":
-        print(f"[!] 站点 {name} 当前处于 parked 状态: {s_cfg.get('parked_reason')}")
-        print(f"[*] 升级建议: {s_cfg.get('todo')}")
         return EXIT_USAGE
     adapter = get_adapter(name, s_cfg, cfg)
     try:
         g_list, meta = rcache.fetch(name, "groups", adapter.groups, rcache.mode_from_args(args))
-        print(cache_note(meta))
+        if meta.get("from_cache"):
+            print(cache_note(meta))
         headers = ["分组名称", "说明", "倍率"]
-        rows = [[g.get("name"), g.get("desc"), str(g.get("ratio"))] for g in g_list]
+        rows = []
+        for g in g_list:
+            rows.append([g.get("name", ""), g.get("desc", ""), str(g.get("ratio", ""))])
         print_table(headers, rows)
         return EXIT_OK
     except AuthError as ae:
@@ -286,29 +174,28 @@ def cmd_groups(args, cfg):
 
 def cmd_keys(args, cfg):
     name = args.site
-    s_cfg = cfg.get("sites", {}).get(name)
+    sites = cfg.get("sites", {})
+    s_cfg = sites.get(name)
     if not s_cfg:
         print(f"[!] 站点 {name} 未登记")
         return EXIT_USAGE
-    if s_cfg.get("tier") == "parked":
-        print(f"[!] 站点 {name} 当前处于 parked 状态: {s_cfg.get('parked_reason')}")
-        print(f"[*] 升级建议: {s_cfg.get('todo')}")
-        return EXIT_USAGE
     adapter = get_adapter(name, s_cfg, cfg)
     try:
-        # Key 列表一律强制实时拉取并更新缓存
-        k_list, meta = rcache.fetch(name, "keys", adapter.list_keys, rcache.MODE_REFRESH)
-        print(cache_note(meta))
+        k_list, meta = rcache.fetch(name, "keys", adapter.list_keys, rcache.mode_from_args(args))
+        if meta.get("from_cache"):
+            print(cache_note(meta))
         headers = ["ID", "名称", "分组", "状态", "剩余额度", "已用额度", "Key (脱敏)"]
-        rows = [[
-            str(k.get("id")),
-            k.get("name"),
-            k.get("group"),
-            k.get("status"),
-            k.get("remain"),
-            k.get("used"),
-            k.get("key_masked")
-        ] for k in k_list]
+        rows = []
+        for k in k_list:
+            rows.append([
+                str(k.get("id", "")),
+                k.get("name", ""),
+                k.get("group", ""),
+                "启用" if k.get("status") == 1 else "禁用",
+                str(k.get("remain_quota", "")),
+                str(k.get("used_quota", "")),
+                k.get("key", "")
+            ])
         print_table(headers, rows)
         return EXIT_OK
     except AuthError as ae:
@@ -323,273 +210,44 @@ def cmd_keys(args, cfg):
 
 def cmd_key_add(args, cfg):
     name = args.site
-    s_cfg = cfg.get("sites", {}).get(name)
+    sites = cfg.get("sites", {})
+    s_cfg = sites.get(name)
     if not s_cfg:
         print(f"[!] 站点 {name} 未登记")
         return EXIT_USAGE
-    if s_cfg.get("tier") == "parked":
-        print(f"[!] 站点 {name} 当前处于 parked 状态: {s_cfg.get('parked_reason')}")
-        print(f"[*] 升级建议: {s_cfg.get('todo')}")
+
+    if not args.unlimited and args.quota is None:
+        print("[!] 必须指定 --quota <额度> 或 --unlimited 之一")
+        return EXIT_USAGE
+    if args.quota is not None and args.quota <= 0:
+        print(f"[!] 额度必须为大于 0 的数值，得到: {args.quota}")
         return EXIT_USAGE
 
-    # 只有 --unlimited 代表无限额度；--quota 必须 > 0
-    if args.unlimited:
-        quota_val = None
-    else:
-        if args.quota is None or args.quota <= 0:
-            print(f"[!] 额度不合法: {args.quota}。--quota 必须大于 0；如需无限额度请改用 --unlimited。")
-            return EXIT_USAGE
-        quota_val = args.quota
-
     if args.dry_run:
-        print(f"[*] [DRY-RUN] 将在 {name} 新建 Key: name={args.name}, group={args.group}, quota={'无限' if args.unlimited else quota_val}")
+        quota_desc = "无限" if args.unlimited else str(args.quota)
+        print(f"[试运行] 将在站点 {name} 创建 Key:")
+        print(f"  名称: {args.name}")
+        print(f"  分组: {args.group}")
+        print(f"  额度: {quota_desc}")
         return EXIT_OK
 
     adapter = get_adapter(name, s_cfg, cfg)
-    models = args.models.split(",") if args.models else None
     try:
-        res = adapter.create_key(args.name, args.group, quota_val, models)
-    except AuthError as ae:
-        print(f"[!] 鉴权失败: {ae}")
-        return EXIT_AUTH
-    except NotSupported as ns:
-        print(f"[!] {ns}")
-        return EXIT_NOTSUPPORTED
-    except ValueError as e:
-        print(f"[!] {e}")
-        return EXIT_USAGE
+        res = adapter.create_key(
+            name=args.name,
+            group=args.group,
+            quota=args.quota,
+            unlimited=args.unlimited,
+            models=args.models.split(",") if args.models else None
+        )
+        rcache.invalidate(name, ["keys"])
+        print(f"[✓] Key 创建成功！ID: {res.get('id')}，脱敏: {res.get('key_masked')}")
+        return EXIT_OK
     except Exception as e:
-        print(f"[!] 新建 Key 失败: {e}")
+        print(f"[!] 创建 Key 失败: {e}")
         return EXIT_FAIL
-
-    new_key_id = res.get("id")
-    print(f"[✓] Key 创建成功！ID: {new_key_id}，脱敏: {res.get('key_masked')}")
-
-    if args.sync:
-        if not new_key_id:
-            print(f"[!] 创建成功但未返回新建 Key ID，已终止自动同步！请手动指定 key-id 进行同步。")
-            return EXIT_FAIL
-        return cmd_sync(argparse.Namespace(
-            site=name, key_id=new_key_id, channel=None, replace_all=False,
-            dry_run=False, test_model=args.test_model), cfg)
-    return EXIT_OK
 
 def cmd_key_set(args, cfg):
-    name = args.site
-    s_cfg = cfg.get("sites", {}).get(name)
-    if not s_cfg:
-        print(f"[!] 站点 {name} 未登记")
-        return EXIT_USAGE
-    if s_cfg.get("tier") == "parked":
-        print(f"[!] 站点 {name} 当前处于 parked 状态: {s_cfg.get('parked_reason')}")
-        return EXIT_USAGE
-
-    status_val = 1 if args.enable else (2 if args.disable else None)
-    status_desc = "启用" if args.enable else ("禁用" if args.disable else "不变")
-
-    # 只有 --unlimited 代表无限额度；--quota 必须 > 0
-    if not args.unlimited and args.quota is not None and args.quota <= 0:
-        print(f"[!] 额度不合法: {args.quota}。--quota 必须大于 0；如需无限额度请改用 --unlimited。")
-        return EXIT_USAGE
-
-    if args.dry_run:
-        quota_desc = "无限" if args.unlimited else (args.quota if args.quota is not None else "不变")
-        print(f"[*] [DRY-RUN] 将修改 {name} Key ID {args.id}:")
-        print(f"    - 分组变更: {args.group or '不变'}")
-        print(f"    - 状态变更: {status_desc}")
-        print(f"    - 额度变更: {quota_desc}")
-        return EXIT_OK
-
-    adapter = get_adapter(name, s_cfg, cfg)
-    try:
-        res = adapter.update_key(args.id, group=args.group, status=status_val,
-                                 quota=args.quota, unlimited=args.unlimited)
-    except AuthError as ae:
-        print(f"[!] 鉴权失败: {ae}")
-        return EXIT_AUTH
-    except NotSupported as ns:
-        print(f"[!] {ns}")
-        return EXIT_NOTSUPPORTED
-    except ValueError as e:
-        print(f"[!] {e}")
-        return EXIT_USAGE
-    except Exception as e:
-        print(f"[!] 修改 Key 失败: {e}")
-        return EXIT_FAIL
-
-    if res.get("status_only"):
-        print(f"[✓] Key {args.id} 状态已更新 ({status_desc}) (via status_only API)！")
-    else:
-        print(f"[✓] Key {args.id} 修改成功！")
-    if args.sync:
-        return cmd_sync(argparse.Namespace(
-            site=name, key_id=args.id, channel=None, replace_all=False,
-            dry_run=False, test_model=args.test_model), cfg)
-    return EXIT_OK
-
-def cmd_key_rm(args, cfg):
-    name = args.site
-    key_id = args.id
-    if not args.yes:
-        print(f"[!] 危险操作：删除 Key 必须带上 --yes 确认！例：relayctl key rm {name} {key_id} --yes")
-        return EXIT_USAGE
-    s_cfg = cfg.get("sites", {}).get(name)
-    if not s_cfg:
-        print(f"[!] 站点 {name} 未登记")
-        return EXIT_USAGE
-    if s_cfg.get("tier") == "parked":
-        print(f"[!] 站点 {name} 当前处于 parked 状态")
-        return EXIT_USAGE
-    adapter = get_adapter(name, s_cfg, cfg)
-    try:
-        adapter.delete_key(key_id)
-    except AuthError as ae:
-        print(f"[!] 鉴权失败: {ae}")
-        return EXIT_AUTH
-    except NotSupported as ns:
-        print(f"[!] {ns}")
-        return EXIT_NOTSUPPORTED
-    except Exception as e:
-        print(f"[!] 删除 Key 失败: {e}")
-        return EXIT_FAIL
-    print(f"[✓] 站点 {name} 上的 Key {key_id} 已成功删除！")
-    return EXIT_OK
-
-def cmd_sync(args, cfg):
-    name = args.site
-    s_cfg = cfg.get("sites", {}).get(name)
-    if not s_cfg:
-        print(f"[!] 站点 {name} 未登记")
-        return EXIT_USAGE
-    if s_cfg.get("tier") == "parked":
-        print(f"[!] 站点 {name} 当前处于 parked 状态: {s_cfg.get('parked_reason')}")
-        return EXIT_USAGE
-
-    # 多渠道处理
-    raw_channels = s_cfg.get("local_channel")
-    if not raw_channels:
-        print(f"[!] 站点 {name} 未关联本地渠道 (local_channel 未设置)")
-        return EXIT_USAGE
-    
-    channel_list = raw_channels if isinstance(raw_channels, list) else [raw_channels]
-    target_ch = args.channel
-    if target_ch:
-        if target_ch not in channel_list:
-            print(f"[!] 指定的渠道 ID {target_ch} 不在站点关联渠道中 ({channel_list})")
-            return EXIT_USAGE
-    else:
-        if len(channel_list) == 1:
-            target_ch = channel_list[0]
-        else:
-            print(f"[!] 站点 {name} 关联了多个本地渠道 ({channel_list})，必须使用 --channel 参数显式指定目标渠道！")
-            return EXIT_USAGE
-
-    adapter = get_adapter(name, s_cfg, cfg)
-    syncer = LocalChannelSyncer(cfg)
-    
-    # 第 4 项：删除自动猜测匹配。不带 --key-id 时只列出上游 key，然后要求指定
-    key_id = args.key_id
-    if not key_id:
-        print(f"[!] 同步操作必须显式指定 --key-id！")
-        print(f"站点 {name} 上游可用 Key 列表:")
-        try:
-            upstream_keys = adapter.list_keys()
-            for k in upstream_keys:
-                print(f"  - ID: {k['id']} | 名称: {k['name']} | 分组: {k['group']} | Key: {k['key_masked']}")
-        except Exception as e:
-            print(f"  获取 Key 列表失败: {e}")
-        print(f"请执行: relayctl sync {name} --key-id <ID> --channel {target_ch} --test-model <模型>")
-        return EXIT_USAGE
-
-    if args.dry_run:
-        print(f"[*] [DRY-RUN] 将提取 {name} Key ID {key_id} 明文并同步至本地渠道 [{target_ch}]")
-        if not args.test_model:
-            print(f"[*] [DRY-RUN] 实际执行前请确认测试模型：--test-model <模型>，或先在渠道里配置 test_model")
-        return EXIT_OK
-
-    try:
-        plain_key = adapter.reveal_key(key_id)
-    except NotSupported as ns:
-        print(f"[!] {ns}")
-        return EXIT_NOTSUPPORTED
-    except AuthError as ae:
-        print(f"[!] 鉴权失败: {ae}")
-        return EXIT_AUTH
-    except Exception as e:
-        print(f"[!] 提取 Key 明文失败: {e}")
-        return EXIT_FAIL
-
-    try:
-        res = syncer.sync_site_key(name, target_ch, plain_key, replace_all=args.replace_all,
-                                   site_base=s_cfg.get("base"),
-                                   test_model=getattr(args, "test_model", None))
-    except (ChannelMismatch, TestModelMissing, ValueError) as e:
-        print(f"[!] {e}")
-        return EXIT_USAGE
-    except NotSupported as ns:
-        print(f"[!] {ns}")
-        return EXIT_NOTSUPPORTED
-    except AuthError as ae:
-        print(f"[!] 鉴权失败: {ae}")
-        return EXIT_AUTH
-    except RuntimeError as e:
-        print(f"[!] {e}")
-        return EXIT_SYNC_FAILED
-    except Exception as e:
-        print(f"[!] 同步失败: {e}")
-        return EXIT_FAIL
-
-    # 用不同的退出码区分「同步没生效」与「回滚没做成」
-    if res.get("ok"):
-        return EXIT_OK
-    if res.get("rolled_back") is False or res.get("verified") is False:
-        return EXIT_ROLLBACK_FAILED
-    if res.get("applied") is False:
-        return EXIT_SYNC_FAILED
-    return EXIT_SYNC_FAILED
-
-def cmd_site_list(args, cfg):
-    sites = cfg.get("sites", {})
-    headers = ["站点", "级别", "适配器", "本地渠道", "Base URL", "原因 / 状态"]
-    rows = []
-    for name, s_cfg in sites.items():
-        rows.append([
-            name,
-            s_cfg.get("tier", "parked"),
-            s_cfg.get("adapter", "-"),
-            format_channels(s_cfg.get("local_channel")),
-            s_cfg.get("base", "-"),
-            s_cfg.get("parked_reason") or "正常"
-        ])
-    print_table(headers, rows)
-    return EXIT_OK
-
-def is_jwt_token(token: str) -> bool:
-    """检查令牌是否明显为临时 JWT"""
-    if not token:
-        return False
-    if token.startswith("Bearer "):
-        token = token[7:].strip()
-    if token.startswith("eyJ") or len(token) > 100:
-        return True
-    parts = token.split(".")
-    if len(parts) == 3 and all(len(p) > 10 for p in parts):
-        return True
-    return False
-
-def probe_site_credentials(name: str, s_cfg: dict, cfg: dict) -> dict:
-    """
-    用真实适配器探测凭据有效性。
-    注意：站点当前 tier=parked 时 get_adapter 只会返回 ParkedAdapter，
-    探测前必须临时脱离 parked，否则 parked 站永远无法晋级。
-    """
-    test_cfg = dict(s_cfg)
-    test_cfg["tier"] = "api" if test_cfg.get("adapter", "newapi") == "newapi" else "script"
-    adapter = get_adapter(name, test_cfg, cfg)
-    return adapter.probe()
-
-
-def cmd_site_auth(args, cfg):
     name = args.site
     sites = cfg.get("sites", {})
     s_cfg = sites.get(name)
@@ -597,359 +255,218 @@ def cmd_site_auth(args, cfg):
         print(f"[!] 站点 {name} 未登记")
         return EXIT_USAGE
 
-    # 第 2 项要求：adapter 不是 newapi 的站（如 wusrouter），不允许通过 site auth 改成 api
-    adapter_name = s_cfg.get("adapter", "newapi")
-    if adapter_name != "newapi":
-        print(f"[!] 站点 {name} 使用适配器 {adapter_name}（非 newapi），不允许通过 site auth 直接配置成 api 级。")
-        print(f"[*] 请按该适配器的会话或脚本流程（如抓取会话放入 state/ 目录）进行处理。")
+    if args.enable and args.disable:
+        print("[!] --enable 和 --disable 互斥，不能同时使用")
+        return EXIT_USAGE
+    if args.unlimited and args.quota is not None:
+        print("[!] --quota 和 --unlimited 互斥，不能同时使用")
+        return EXIT_USAGE
+    if args.quota is not None and args.quota <= 0:
+        print(f"[!] 额度必须为大于 0 的数值，得到: {args.quota}")
         return EXIT_USAGE
 
-    print(f"--- 为站点 {name} ({s_cfg.get('base')}) 配置长期系统访问令牌 ---")
-    token = getpass.getpass("请输入系统访问令牌 (约32位hex长期令牌，输入不回显): ").strip()
-    
-    if is_jwt_token(token):
-        print(f"[!] 拒绝保存：您输入的令牌格式明显为临时 JWT / 会话 Token（以 eyJ 开头或三段式，几小时后即过期）！")
-        print(f"[!] 请前往站点【个人设置 → 系统访问令牌】页面生成长效 Access Token。")
-        return EXIT_USAGE
+    status = None
+    if args.enable:
+        status = 1
+    elif args.disable:
+        status = 2
 
-    uid_str = input("请输入用户 ID (user_id/uid, 回车留空): ").strip()
-    uid = int(uid_str) if uid_str.isdigit() else None
-
-    # 先保存凭据进临时测试字典
-    test_cfg = dict(s_cfg)
-    test_cfg["auth"] = {"access_token": token, "user_id": uid}
-    
-    print(f"[*] 正在验证令牌有效性 (probe) ...")
-    probe_res = probe_site_credentials(name, test_cfg, cfg)
-    
-    if probe_res.get("auth_ok"):
-        s_cfg["auth"] = {"access_token": token, "user_id": uid}
-        s_cfg["tier"] = "api"
-        s_cfg["parked_reason"] = None
-        s_cfg["todo"] = None
-        save_config(cfg)
-        update_site_doc_section(name, "api", None, None)
-        print(f"[✓] 鉴权验证成功！用户: {probe_res.get('username')}, 站点 {name} 已正式晋级为 api！")
+    if args.dry_run:
+        print(f"[试运行] 将修改站点 {name} 的 Key ID: {args.id}")
+        if status: print(f"  状态: {'启用' if status == 1 else '禁用'}")
+        if args.group: print(f"  分组: {args.group}")
         return EXIT_OK
-    else:
-        # 失败保持 parked
-        s_cfg["auth"] = {"access_token": token, "user_id": uid}
-        s_cfg["tier"] = "parked"
-        s_cfg["parked_reason"] = f"凭据验证未通过 ({probe_res.get('auth_msg') or '鉴权失败'})"
-        s_cfg["todo"] = f"relayctl site auth {name}"
-        save_config(cfg)
-        update_site_doc_section(name, "parked", s_cfg["parked_reason"], s_cfg["todo"])
-        print(f"[!] 凭据验证失败: {probe_res.get('auth_msg')}")
-        print(f"[!] 站点保持 parked 状态。请确认是在【个人设置】里生成的系统访问令牌，而不是网页登录 token！")
-        return EXIT_AUTH
 
-def cmd_site_add(args, cfg):
-    name = args.name
-    sites = cfg.get("sites", {})
-    
-    if name in sites and not args.force:
-        print(f"[!] 站点 {name} 已存在于配置中！为防止误清空凭据，已终止操作。如需强制覆盖请添加 --force 参数。")
-        return EXIT_USAGE
-
-    base_url = args.base.rstrip("/")
-    
-    proxy_val = None
-    if args.proxy == "none":
-        proxy_val = None
-    elif args.proxy and args.proxy != "auto":
-        proxy_val = args.proxy
-    else:
-        print(f"[*] 正在尝试直连探测 {base_url} ...")
-        direct_client = HttpClient(base_url, proxy=None)
-        try:
-            r = direct_client.get("/api/status", timeout=5)
-            if r.status_code == 200:
-                print("[✓] 直连成功！")
-                proxy_val = None
-            else:
-                proxy_val = "http://127.0.0.1:7890"
-        except Exception:
-            print("[*] 直连超时或失败，已自动启用代理 (http://127.0.0.1:7890)")
-            proxy_val = "http://127.0.0.1:7890"
-
-    print(f"[*] 正在自动探测新站点系统架构: {name} ({base_url})...")
-    client = HttpClient(base_url, proxy=proxy_val)
-    
-    detected_type = "unknown"
-    suggested_tier = "parked"
-    suggested_adapter = "newapi"
-    parked_reason = None
-    todo = None
-    display_type = "USD"
-    panel_flavor = "newapi"
-    
+    adapter = get_adapter(name, s_cfg, cfg)
     try:
-        r = client.get("/api/status", timeout=8)
-        if r.status_code == 200:
-            d = r.json().get("data", {})
-            if "system_name" in d or "version" in d:
-                detected_type = f"New API ({d.get('system_name', '')} {d.get('version', '')})"
-                suggested_adapter = "newapi"
-                display_type = d.get("quota_display_type", "USD")
-                parked_reason = "缺少系统访问令牌+uid"
-                todo = f"在站点个人设置中生成系统访问令牌，执行 relayctl site auth {name}"
-                # 检查是经典版还是新版
-                ver = d.get("version", "").lower()
-                if "one-api" in ver or "0.2" in ver or "0.3" in ver:
-                    panel_flavor = "classic"
-    except Exception:
-        pass
+        res = adapter.update_key(
+            key_id=args.id,
+            status=status,
+            group=args.group,
+            quota=args.quota,
+            unlimited=args.unlimited
+        )
+        rcache.invalidate(name, ["keys"])
+        print(f"[✓] Key {args.id} 更新成功！")
+        return EXIT_OK
+    except Exception as e:
+        print(f"[!] 修改 Key 失败: {e}")
+        return EXIT_FAIL
 
-    if detected_type == "unknown":
-        try:
-            r = client.get("/api/v1/user", timeout=8)
-            if r.status_code == 401:
-                detected_type = "自研面板 (支持 /api/v1/user)"
-                suggested_adapter = "wusrouter"
-                parked_reason = "无有效登录会话"
-                todo = "在 Chrome 登录并抓取会话 cookie / token"
-        except Exception:
-            pass
-
-    if detected_type == "unknown":
-        parked_reason = "管理接口未知或全 404"
-        todo = "在 Chrome 登录后抓包排查是否支持脚本/API 接入"
-
-    # 解析 local_channel (支持逗号分隔多渠道)
-    ch_val = None
-    if args.channel:
-        if "," in args.channel:
-            ch_val = [int(x.strip()) for x in args.channel.split(",") if x.strip().isdigit()]
-        elif args.channel.isdigit():
-            ch_val = int(args.channel)
-    else:
-        try:
-            syncer = LocalChannelSyncer(cfg)
-            channels = syncer.list_channels()
-            matched_ids = [c["id"] for c in channels if c.get("base_url", "").rstrip("/") == base_url]
-            if len(matched_ids) == 1:
-                ch_val = matched_ids[0]
-            elif len(matched_ids) > 1:
-                ch_val = matched_ids
-        except Exception:
-            pass
-
-    wallet_path = "/console/topup" if panel_flavor == "classic" else "/wallet"
-    keys_path = "/console/token" if panel_flavor == "classic" else "/keys"
-
-    if "sites" not in cfg:
-        cfg["sites"] = {}
-    cfg["sites"][name] = {
-        "tier": suggested_tier,
-        "adapter": suggested_adapter,
-        "base": base_url,
-        "proxy": proxy_val,
-        "auth": {"access_token": "", "user_id": None},
-        "local_channel": ch_val,
-        "wallet_path": wallet_path,
-        "keys_path": keys_path,
-        "parked_reason": parked_reason,
-        "todo": todo
-    }
-    save_config(cfg)
-    print(f"[✓] 站点 {name} 已成功添加！")
-    print(f"  - 识别系统: {detected_type}")
-    print(f"  - 初始级别: {suggested_tier}")
-    print(f"  - 本地渠道: {ch_val}")
-    print(f"  - 下一步指引: {todo}")
-    return EXIT_OK
-
-def cmd_site_set(args, cfg):
+def cmd_key_rm(args, cfg):
     name = args.site
     sites = cfg.get("sites", {})
-    if name not in sites:
+    s_cfg = sites.get(name)
+    if not s_cfg:
         print(f"[!] 站点 {name} 未登记")
         return EXIT_USAGE
-    s = sites[name]
 
-    # 晋级为 api 必须与 site auth 同一标准：先 probe 通过，否则拒收（除非显式 --force）
-    if args.tier == "api" and not args.force:
-        adapter_name = s.get("adapter", "newapi")
-        if adapter_name != "newapi":
-            print(f"[!] 站点 {name} 使用适配器 {adapter_name}（非 newapi），不允许直接晋级为 api。")
-            print(f"[*] 如确需强制晋级，请显式附带 --force。")
+    if not args.yes:
+        print(f"[!] 删除 Key 是破坏性操作。请添加 --yes 参数以确认删除 Key ID: {args.id}")
+        return EXIT_USAGE
+
+    adapter = get_adapter(name, s_cfg, cfg)
+    try:
+        adapter.delete_key(key_id=args.id)
+        rcache.invalidate(name, ["keys"])
+        print(f"[✓] 站点 {name} 的 Key ID: {args.id} 已成功删除。")
+        return EXIT_OK
+    except Exception as e:
+        print(f"[!] 删除 Key 失败: {e}")
+        return EXIT_FAIL
+
+def cmd_probe(args, cfg):
+    target = args.site
+    sites = cfg.get("sites", {})
+    
+    if target == "all":
+        check_list = list(sites.keys())
+    else:
+        if target not in sites:
+            print(f"[!] 站点 {target} 未登记")
             return EXIT_USAGE
+        check_list = [target]
 
-        print(f"[*] 晋级为 api 前，先用现有凭据执行 probe 验证 ...")
+    headers = ["站点", "识别系统", "版本", "鉴权状态", "配额底数", "计费币种"]
+    rows = []
+
+    for name in check_list:
+        s_cfg = sites[name]
+        adapter = get_adapter(name, s_cfg, cfg)
         try:
-            probe_res = probe_site_credentials(name, s, cfg)
-        except AuthError as ae:
-            probe_res = {"auth_ok": False, "auth_msg": str(ae)}
+            p = adapter.probe()
+            auth_str = "有效" if p.get("auth_ok") else f"失效 ({p.get('auth_status')})"
+            rows.append([
+                name,
+                p.get("system_name", "未知"),
+                p.get("version", "未知"),
+                auth_str,
+                str(p.get("quota_per_unit", "-")),
+                p.get("quota_display_type", "-")
+            ])
         except Exception as e:
-            print(f"[!] 探测异常: {e}，站点保持原级别 {s.get('tier')}，未做变更。")
-            return EXIT_FAIL
+            rows.append([name, "探测异常", "-", str(e), "-", "-"])
 
-        if not probe_res.get("auth_ok"):
-            now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-            reason = f"凭据验证未通过 ({probe_res.get('auth_msg') or probe_res.get('auth_error') or '鉴权失败'}) ({now_str})"
-            s["tier"] = "parked"
-            s["parked_reason"] = reason
-            s["todo"] = f"relayctl site auth {name}"
-            save_config(cfg)
-            update_site_doc_section(name, "parked", reason, s["todo"])
-            print(f"[!] {reason}，已保持/降级为 parked，未晋级为 api。")
-            print(f"[*] 如确需绕过验证强制晋级，请显式附带 --force。")
-            return EXIT_AUTH
-
-    if args.tier:
-        s["tier"] = args.tier
-        if args.tier != "parked":
-            s["parked_reason"] = None
-            s["todo"] = None
-    if args.channel is not None:
-        if "," in args.channel:
-            s["local_channel"] = [int(x.strip()) for x in args.channel.split(",") if x.strip().isdigit()]
-        elif args.channel.isdigit():
-            s["local_channel"] = int(args.channel)
-        elif args.channel.lower() == "none":
-            s["local_channel"] = None
-    if args.adapter:
-        s["adapter"] = args.adapter
-    save_config(cfg)
-    print(f"[✓] 站点 {name} 配置已更新！")
+    print_table(headers, rows)
     return EXIT_OK
+
+def cmd_site_list(args, cfg):
+    sites = cfg.get("sites", {})
+    headers = ["站点名称", "级别 (Tier)", "适配器 (Adapter)", "Base URL"]
+    rows = []
+    for name, s_cfg in sites.items():
+        rows.append([
+            name,
+            s_cfg.get("tier", "parked"),
+            s_cfg.get("adapter", "newapi"),
+            s_cfg.get("base", "")
+        ])
+    print_table(headers, rows)
+    return EXIT_OK
+
+def cmd_site_auth(args, cfg):
+    name = args.site
+    sites = cfg.get("sites", {})
+    s_cfg = sites.get(name)
+    if not s_cfg:
+        print(f"[!] 站点 {name} 未在 sites.yaml 登记")
+        return EXIT_USAGE
+
+    base_url = s_cfg.get("base", "")
+    print(f"[*] 正在为站点 {name} ({base_url}) 录入凭据...")
+    token = getpass.getpass("请输入长期系统访问令牌 (System Access Token): ").strip()
+    if not token:
+        print("[!] 访问令牌不能为空")
+        return EXIT_USAGE
+
+    uid_str = input("请输入该站点的 User ID (UID，纯数字，可留空): ").strip()
+    uid = int(uid_str) if uid_str.isdigit() else None
+
+    s_cfg.setdefault("auth", {})
+    s_cfg["auth"]["access_token"] = token
+    s_cfg["auth"]["user_id"] = uid
+
+    adapter = get_adapter(name, s_cfg, cfg)
+    print("[*] 正在验证凭据有效性...")
+    p = adapter.probe()
+    if p.get("auth_ok"):
+        s_cfg["tier"] = "api"
+        s_cfg["parked_reason"] = None
+        save_config(cfg)
+        rcache.invalidate(name)
+        print(f"[✓] 鉴权成功！站点 {name} 已晋级为 api 级别！")
+        return EXIT_OK
+    else:
+        print(f"[!] 鉴权未通过: HTTP {p.get('auth_status')}")
+        return EXIT_AUTH
 
 def cmd_site_rm(args, cfg):
     name = args.site
-    if not args.yes:
-        print(f"[!] 删除站点属于破坏性操作，请添加 --yes 确认：relayctl site rm {name} --yes")
-        return EXIT_USAGE
     sites = cfg.get("sites", {})
     if name not in sites:
         print(f"[!] 站点 {name} 未登记")
         return EXIT_USAGE
+    if not args.yes:
+        print(f"[!] 删除配置是破坏性操作。请添加 --yes 确认删除站点 {name}")
+        return EXIT_USAGE
     del sites[name]
     save_config(cfg)
-    
-    doc_path = os.path.join(parent_dir, "docs", "sites.md")
-    if os.path.exists(doc_path):
-        with open(doc_path, "r", encoding="utf-8") as f:
-            content = f.read()
-        pattern = re.compile(rf"^(##\s+(\d+\.\s*)?){re.escape(name)}\b", re.MULTILINE)
-        content = pattern.sub(r"\1[Removed] " + name, content)
-        with open(doc_path, "w", encoding="utf-8") as f:
-            f.write(content)
-            
-    print(f"[✓] 站点 {name} 配置已删除，docs/sites.md 对应章节已精确标记为 [Removed] 保留历史。")
+    rcache.invalidate(name)
+    print(f"[✓] 站点 {name} 已成功移除。")
     return EXIT_OK
-
-def cmd_cache(args, cfg):
-    sub = getattr(args, "subcommand", None)
-    if sub == "clear":
-        if args.site:
-            rcache.invalidate(args.site)
-            print(f"[✓] 已清除站点 {args.site} 的缓存")
-        else:
-            n = rcache.clear_all()
-            print(f"[✓] 已清除全部缓存（{n} 个站点）")
-        return EXIT_OK
-    # show
-    sites = [args.site] if getattr(args, "site", None) else list(cfg.get("sites", {}).keys())
-    out = {}
-    rows = []
-    for name in sites:
-        secs = {}
-        for sec in ("balance", "groups", "keys", "probe"):
-            ent = rcache.read(name, sec)
-            if ent:
-                secs[sec] = {"fetched_at": ent.get("fetched_at"), "age": rcache.age_text(ent["ts"])}
-                if args.json:
-                    secs[sec]["data"] = ent.get("data")
-        out[name] = secs
-        if secs:
-            rows.append([name] + [
-                secs[s]["fetched_at"] if s in secs else "-"
-                for s in ("balance", "groups", "keys", "probe")])
-    if args.json:
-        print(json.dumps({"sites": out}, ensure_ascii=False, indent=2))
-    else:
-        print("缓存永久有效，下表为各分段最新更新时间（--refresh 重新拉取）")
-        print_table(["站点", "余额", "分组", "Key", "探测"], rows)
-    return EXIT_OK
-
-def _add_cache_flags(p, allow_cached=True):
-    g = p.add_mutually_exclusive_group()
-    g.add_argument("--refresh", action="store_true", help="忽略缓存，实时拉取并更新缓存")
-    if allow_cached:
-        g.add_argument("--cached", action="store_true", help="只读本地缓存，没有缓存也不请求中转站")
 
 def main():
-    parser = argparse.ArgumentParser(prog="relayctl", description="中转站余额 / 分组 / Key 统一管理工具")
+    parser = argparse.ArgumentParser(description="relayctl: 统一多上游 AI 中转站 Key 与余额管理的轻量级工具 (CLI + Web)")
     subparsers = parser.add_subparsers(dest="command")
 
     # balance
-    p_bal = subparsers.add_parser("balance", help="查看指定站点的当前余额详情")
+    p_bal = subparsers.add_parser("balance", help="查看指定站点的额度详情")
     p_bal.add_argument("site", help="站点名称")
-    _add_cache_flags(p_bal)
+    p_bal.add_argument("--refresh", action="store_true", help="强制从上游重新拉取")
 
     # status
-    p_status = subparsers.add_parser("status", help="查看所有上游站点状态汇总")
-    p_status.add_argument("--json", action="store_true", help="JSON 格式输出")
-    _add_cache_flags(p_status)
+    p_stat = subparsers.add_parser("status", help="列出所有上游站点状态汇总表")
+    p_stat.add_argument("--json", action="store_true", help="输出 JSON 格式")
+    p_stat.add_argument("--refresh", action="store_true", help="强制从上游重新拉取")
 
     # probe
-    p_probe = subparsers.add_parser("probe", help="探测上游站点接口与鉴权状态")
-    p_probe.add_argument("site", help="站点名称，或 all")
+    p_probe = subparsers.add_parser("probe", help="探测站点健康度与鉴权有效性")
+    p_probe.add_argument("site", help="站点名称，或传 'all'")
 
     # groups
     p_groups = subparsers.add_parser("groups", help="查看指定站点的可用模型分组")
     p_groups.add_argument("site", help="站点名称")
-    _add_cache_flags(p_groups)
+    p_groups.add_argument("--refresh", action="store_true", help="强制从上游重新拉取")
 
     # keys
     p_keys = subparsers.add_parser("keys", help="查看指定站点的 Key 列表")
     p_keys.add_argument("site", help="站点名称")
-    _add_cache_flags(p_keys, allow_cached=False)  # keys 恒为实时拉取
-
-    # cache
-    p_cache = subparsers.add_parser("cache", help="查看 / 清除中转站信息本地缓存")
-    cache_subs = p_cache.add_subparsers(dest="subcommand")
-    p_cshow = cache_subs.add_parser("show", help="查看缓存（默认）")
-    p_cshow.add_argument("site", nargs="?", help="站点名称（省略为全部）")
-    p_cshow.add_argument("--json", action="store_true", help="JSON 输出（含脱敏数据）")
-    p_cclear = cache_subs.add_parser("clear", help="清除缓存")
-    p_cclear.add_argument("site", nargs="?", help="站点名称（省略为全部）")
+    p_keys.add_argument("--refresh", action="store_true", help="强制从上游重新拉取")
 
     # key
-    p_key = subparsers.add_parser("key", help="Key 管理操作")
+    p_key = subparsers.add_parser("key", help="Key 生命周期管理 (add / set / rm)")
     key_subs = p_key.add_subparsers(dest="subcommand")
-    
+
     # key add
     p_kadd = key_subs.add_parser("add", help="新建 Key")
     p_kadd.add_argument("site", help="站点名称")
     p_kadd.add_argument("--name", required=True, help="Key 名称")
-    p_kadd.add_argument("--group", required=True, help="分组名称")
-    quota_group = p_kadd.add_mutually_exclusive_group(required=True)
-    quota_group.add_argument("--quota", type=float, help="指定额度 (与 relayctl status 显示的单位一致)")
-    quota_group.add_argument("--unlimited", action="store_true", help="设为无限额度")
-    p_kadd.add_argument("--models", help="限制模型列表，英文逗号分隔")
-    p_kadd.add_argument("--sync", action="store_true", help="新建后自动同步至本地 New API")
-    p_kadd.add_argument("--test-model", dest="test_model",
-                        help="同步时用于验证渠道连通性的模型（不指定则取渠道自身的 test_model）")
-    p_kadd.add_argument("--dry-run", "--dry_run", dest="dry_run",
-                        action="store_true", help="试运行预览 (兼容 --dry_run)")
+    p_kadd.add_argument("--group", required=True, help="模型分组 (Group)")
+    p_kadd.add_argument("--quota", type=float, help="额度设置")
+    p_kadd.add_argument("--unlimited", action="store_true", help="设为无限额度")
+    p_kadd.add_argument("--models", help="限制模型 (逗号分隔)")
+    p_kadd.add_argument("--dry-run", dest="dry_run", action="store_true", help="试运行预览")
 
     # key set
     p_kset = key_subs.add_parser("set", help="修改 Key")
     p_kset.add_argument("site", help="站点名称")
     p_kset.add_argument("id", type=int, help="Key ID")
     p_kset.add_argument("--group", help="修改分组")
-    status_group = p_kset.add_mutually_exclusive_group()
-    status_group.add_argument("--enable", action="store_true", help="启用 Key")
-    status_group.add_argument("--disable", action="store_true", help="禁用 Key")
-    set_quota_group = p_kset.add_mutually_exclusive_group()
-    set_quota_group.add_argument("--quota", type=float, help="修改额度 (与 relayctl status 显示的单位一致)")
-    set_quota_group.add_argument("--unlimited", action="store_true", help="改为无限额度")
-    p_kset.add_argument("--sync", action="store_true", help="修改后自动同步至本地 New API")
-    p_kset.add_argument("--test-model", dest="test_model",
-                        help="同步时用于验证渠道连通性的模型（不指定则取渠道自身的 test_model）")
-    p_kset.add_argument("--dry-run", "--dry_run", dest="dry_run",
-                        action="store_true", help="试运行预览 (兼容 --dry_run)")
+    p_kset.add_argument("--enable", action="store_true", help="启用 Key")
+    p_kset.add_argument("--disable", action="store_true", help="禁用 Key")
+    p_kset.add_argument("--quota", type=float, help="修改额度")
+    p_kset.add_argument("--unlimited", action="store_true", help="改为无限额度")
+    p_kset.add_argument("--dry-run", dest="dry_run", action="store_true", help="试运行预览")
 
     # key rm
     p_krm = key_subs.add_parser("rm", help="删除 Key")
@@ -957,56 +474,20 @@ def main():
     p_krm.add_argument("id", type=int, help="Key ID")
     p_krm.add_argument("--yes", action="store_true", help="确认删除 (破坏性操作)")
 
-    # sync
-    p_sync = subparsers.add_parser("sync", help="将上游 Key 同步至本地 New API 对应渠道")
-    p_sync.add_argument("site", help="站点名称")
-    p_sync.add_argument("--key-id", type=int, help="指定要同步的上游 Key ID")
-    p_sync.add_argument("--channel", type=int, help="指定目标本地渠道 ID（多渠道站点必填）")
-    p_sync.add_argument("--replace-all", action="store_true", help="若本地渠道为多 Key 轮询，确认整体替换")
-    p_sync.add_argument("--test-model", dest="test_model",
-                        help="用于验证渠道连通性的模型；渠道未配置 test_model 时必填，避免拿错模型误回滚")
-    p_sync.add_argument("--dry-run", "--dry_run", dest="dry_run",
-                        action="store_true", help="试运行预览 (兼容 --dry_run)")
-
-    # pull-browser
-    p_pull = subparsers.add_parser("pull-browser", help="从已登录 Chrome 抓取站点实时余额与 Key（必须带 --manual 手动激活）")
-    p_pull.add_argument("--manual", action="store_true", help="人工手动激活确认标志（禁止任何定时/后台自动化静默调用）")
-
-    # check-parked
-    subparsers.add_parser("check-parked", help="自动化探测第 2 类受限/未纳管站点的网络健康度与解封状态")
-
-    # web (双端适配控制台)
-    p_web = subparsers.add_parser("web", help="启动适配移动端与桌面端的 Web 管理控制台")
-    p_web.add_argument("--host", default="0.0.0.0", help="监听地址 (默认 0.0.0.0)")
-    p_web.add_argument("--port", type=int, default=8088, help="监听端口 (默认 8088)")
-
     # site
-    p_site = subparsers.add_parser("site", help="站点配置与生命周期管理")
+    p_site = subparsers.add_parser("site", help="站点配置管理")
     site_subs = p_site.add_subparsers(dest="subcommand")
-    
-    p_slist = site_subs.add_parser("list", help="列出所有配置的站点")
-    
-    p_sauth = site_subs.add_parser("auth", help="配置站点的访问凭据 (交互式不回显)")
+    site_subs.add_parser("list", help="列出所有配置的站点")
+    p_sauth = site_subs.add_parser("auth", help="录入长期系统访问令牌")
     p_sauth.add_argument("site", help="站点名称")
-
-    p_sadd = site_subs.add_parser("add", help="添加并自动探测新上游站点")
-    p_sadd.add_argument("name", help="新站点标识")
-    p_sadd.add_argument("--base", required=True, help="站点 Base URL")
-    p_sadd.add_argument("--proxy", default="auto", help="代理配置 (auto | none | http://...)")
-    p_sadd.add_argument("--channel", help="对应的本地 New API 渠道 ID，可单个或逗号分隔多个")
-    p_sadd.add_argument("--force", action="store_true", help="若已存在则强制覆盖")
-
-    p_sset = site_subs.add_parser("set", help="修改站点配置")
-    p_sset.add_argument("site", help="站点名称")
-    p_sset.add_argument("--tier", choices=["api", "script", "parked"], help="修改级别")
-    p_sset.add_argument("--channel", help="修改本地渠道 ID (单个数字或逗号分隔或 none)")
-    p_sset.add_argument("--adapter", help="修改适配器名称")
-    p_sset.add_argument("--force", action="store_true",
-                        help="跳过 probe 验证强制晋级为 api（危险，仅在你确认凭据有效时使用）")
-
     p_srm = site_subs.add_parser("rm", help="删除站点配置")
     p_srm.add_argument("site", help="站点名称")
-    p_srm.add_argument("--yes", action="store_true", help="确认删除 (破坏性操作)")
+    p_srm.add_argument("--yes", action="store_true", help="确认删除")
+
+    # web
+    p_web = subparsers.add_parser("web", help="启动双端自适应 Web 管理控制台")
+    p_web.add_argument("--host", default="0.0.0.0", help="监听地址 (默认 0.0.0.0)")
+    p_web.add_argument("--port", type=int, default=8088, help="监听端口 (默认 8088)")
 
     args = parser.parse_args()
     if not args.command:
@@ -1035,16 +516,6 @@ def main():
             rc = cmd_key_rm(args, cfg)
         else:
             p_key.print_help()
-    elif args.command == "sync":
-        rc = cmd_sync(args, cfg)
-    elif args.command == "cache":
-        if not getattr(args, "subcommand", None):
-            args.subcommand, args.site, args.json = "show", None, False
-        rc = cmd_cache(args, cfg)
-    elif args.command == "pull-browser":
-        run_managed_browser_sync(manual=args.manual)
-    elif args.command == "check-parked":
-        run_parked_check()
     elif args.command == "web":
         from relayctl.web import run_web
         run_web(host=args.host, port=args.port)
@@ -1054,35 +525,10 @@ def main():
             rc = cmd_site_list(args, cfg)
         elif args.subcommand == "auth":
             rc = cmd_site_auth(args, cfg)
-        elif args.subcommand == "add":
-            rc = cmd_site_add(args, cfg)
-        elif args.subcommand == "set":
-            rc = cmd_site_set(args, cfg)
         elif args.subcommand == "rm":
             rc = cmd_site_rm(args, cfg)
         else:
             p_site.print_help()
-
-    # Key 写操作成功后强制实时拉取 Key 列表，刷新缓存
-    try:
-        if args.command == "key" and getattr(args, "subcommand", None) in ("add", "set", "rm") \
-                and rc == EXIT_OK and not getattr(args, "dry_run", False):
-            s_cfg = cfg.get("sites", {}).get(args.site)
-            if s_cfg and s_cfg.get("tier") != "parked":
-                try:
-                    _, m = rcache.fetch(args.site, "keys",
-                                        get_adapter(args.site, s_cfg, cfg).list_keys,
-                                        rcache.MODE_REFRESH)
-                    print(f"[*] Key 缓存已更新，{cache_note(m)}")
-                except Exception as e:
-                    rcache.invalidate(args.site, ["keys"])
-                    print(f"[!] Key 列表重新拉取失败，已作废旧 Key 缓存: {e}")
-        elif args.command == "site" and args.subcommand in ("auth", "set", "rm", "add"):
-            target = getattr(args, "site", None) or getattr(args, "name", None)
-            if target:
-                rcache.invalidate(target)
-    except Exception as e:
-        print(f"[!] 缓存失效处理异常（不影响本次操作结果）: {e}")
 
     sys.exit(rc)
 
