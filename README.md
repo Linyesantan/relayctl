@@ -38,8 +38,6 @@
 - 📊 **站点与分组倍率直查**：
   * 统一查询各中转站当前生效的用户分组、标定倍率及站长原始描述（如 `pro`、`claude`、`特价` 分组）；
   * 自动化 `probe` 探测站点健康度、系统底层版本及鉴权有效性。
-- 💰 **严格纯数字不换算纪律**：
-  * 统一按各站点底层 `quota / quota_per_unit` 计算纯数字额度，杜绝虚假汇率换算与虚构货币符号拼接。
 - 🛡️ **防高频机器扫描纪律**：
   * 内置智能短期只读缓存，常规非写操作优先读取缓存，避免暴力请求上游敏感管理端点（如全量定价 `/api/pricing`），防止被站长风控误判为恶意爬站。
 
@@ -118,8 +116,8 @@ relayctl web --port 8088
 
 | 命令 | 说明 |
 |---|---|
-| `relayctl status [--json]` | 列出所有上游站点状态汇总表（余额纯数字、用户分组、Key数、健康度诊断） |
-| `relayctl balance <site>` | 查看指定站点的精确额度详情（统一不换算，金额 = quota / quota_per_unit） |
+| `relayctl status [--json]` | 列出所有上游站点状态汇总表（余额、用户分组、Key数、健康度诊断） |
+| `relayctl balance <site>` | 查看指定站点的额度详情 |
 | `relayctl groups <site>` | 查看指定站点的可用模型分组及标定倍率 |
 | `relayctl keys <site>` | 查看指定站点的全部 Key 列表（脱敏显示，防截屏泄露） |
 | `relayctl key add <site> --name X --group G (--quota N\|--unlimited)` | 在上游新建 Key，强制指定额度数值或无限额度 |
