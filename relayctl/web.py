@@ -446,8 +446,11 @@ class RelayctlWebHandler(BaseHTTPRequestHandler):
         if path == "/api/status":
             query = urllib.parse.parse_qs(url_parts.query)
             force_refresh = "refresh" in query
-            data = []
-            for s_name, s_cfg in sites.items():
+            
+            from concurrent.futures import ThreadPoolExecutor
+
+            def process_site(item):
+                s_name, s_cfg = item
                 tier = s_cfg.get("tier", "parked")
                 ch = s_cfg.get("local_channel")
                 channel_str = ",".join(map(str, ch)) if isinstance(ch, list) else (str(ch) if ch else "-")
@@ -482,7 +485,11 @@ class RelayctlWebHandler(BaseHTTPRequestHandler):
                 else:
                     info["diagnosis"] = s_cfg.get("parked_reason") or "已搁置"
 
-                data.append(info)
+                return info
+
+            # 并发抓取各站点信息，防止单个慢站点拖垮整体响应
+            with ThreadPoolExecutor(max_workers=min(len(sites) or 1, 10)) as executor:
+                data = list(executor.map(process_site, sites.items()))
 
             self._send_json({"success": True, "data": data})
             return
