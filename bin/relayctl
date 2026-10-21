@@ -22,6 +22,7 @@ from relayctl import importers  # noqa: E402
 from relayctl import migrate as rmigrate  # noqa: E402
 from relayctl import paths  # noqa: E402
 from relayctl import probe as rprobe  # noqa: E402
+from relayctl import script_adapter as rscript  # noqa: E402
 from relayctl.core import print_table  # noqa: E402
 from relayctl.errors import (  # noqa: E402
     EXIT_OK, EXIT_FAIL, EXIT_AUTH, EXIT_NOTSUPPORTED, EXIT_USAGE,
@@ -525,6 +526,102 @@ def cmd_site_auth(args, cfg):
 
 
 # ---------------------------------------------------------------------------
+# 站点脚本 (relayctl script new / test)
+# ---------------------------------------------------------------------------
+def cmd_script_new(args, cfg):
+    s_cfg = _site(cfg, args.site)
+    name = paths.safe_site_name(args.site)
+    paths.ensure_dir(paths.scripts_dir())
+    target = os.path.join(paths.scripts_dir(), f"{name}.py")
+
+    if os.path.exists(target) and not args.force:
+        raise ConfigError(f"脚本已存在（--force 覆盖）: {target}")
+
+    docs = dict(s_cfg.get("docs") or rconfig.DEFAULT_DOCS)
+    howto = (docs.get("script_howto") or "").strip() or rscript.DEFAULT_SCRIPT_HOWTO
+    paths.atomic_write_text(target, rscript.script_template(name, howto),
+                            mode=rscript.SCRIPT_FILE_MODE)
+
+    data = dict(s_cfg)
+    data["docs"] = {**rconfig.DEFAULT_DOCS, **docs, "script_howto": howto}
+    data["adapter"] = "script"
+    data["script"] = f"scripts/{name}.py"   # 相对 $RELAYCTL_HOME 保存
+    data["name"] = name
+    saved = rconfig.save_site(name, data)
+    rcache.invalidate(name)
+
+    print(f"[✓] 脚本模板已生成: {target} (0750)")
+    print(f"[✓] 站点 {name} 已切换: adapter=script script={data['script']} ({saved})")
+    print(f"[*] 补全 TODO 后执行: relayctl script test {name}")
+    return EXIT_OK
+
+
+def _script_status_text(status: str) -> str:
+    return {
+        rscript.STATUS_OK: "supported",
+        rscript.STATUS_UNSUPPORTED: "unsupported",
+        rscript.STATUS_AUTH: "failed(auth)",
+        rscript.STATUS_TIMEOUT: "failed(timeout)",
+        rscript.STATUS_ERROR: "failed",
+    }.get(status, "failed")
+
+
+def cmd_script_test(args, cfg):
+    s_cfg = _site(cfg, args.site)
+    adapter = get_adapter(args.site, s_cfg, cfg)
+    if getattr(adapter, "NAME", None) != "script":
+        raise ConfigError(
+            f"站点 {args.site} 的 adapter 不是 script（当前 {s_cfg.get('adapter')}），"
+            f"请先执行 relayctl script new {args.site}")
+
+    actions = [args.action] if args.action else list(rscript.ACTIONS)
+    outcomes = adapter.test_actions(actions)
+
+    failed = [o for o in outcomes if o.status in (rscript.STATUS_ERROR,
+                                                  rscript.STATUS_AUTH,
+                                                  rscript.STATUS_TIMEOUT)]
+    supported = [o for o in outcomes if o.ok]
+    unsupported = [o for o in outcomes if o.status == rscript.STATUS_UNSUPPORTED]
+    report = {
+        "site": args.site,
+        "script": adapter.script_path,
+        "timeout": adapter.runner.timeout,
+        "ok": not failed,
+        "summary": {
+            "total": len(outcomes),
+            "supported": len(supported),
+            "unsupported": len(unsupported),
+            "failed": len(failed),
+        },
+        "actions": [o.as_dict() for o in outcomes],
+    }
+
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+        return EXIT_OK if not failed else EXIT_FAIL
+
+    print(f"[*] 站点 {args.site} 脚本体检: {adapter.script_path}"
+          f"（超时 {adapter.runner.timeout}s）")
+    for o in outcomes:
+        line = (f"  {o.action:<12} {_script_status_text(o.status):<14}"
+                f"退出码={o.exit_code}  {o.elapsed * 1000:.1f}ms")
+        print(line)
+        if o.data is not None:
+            text = json.dumps(o.data, ensure_ascii=False, default=str)
+            if len(text) > 200:
+                text = text[:200] + "…"
+            print(f"      结果: {text}")
+        if o.error and not o.ok and o.status != rscript.STATUS_UNSUPPORTED:
+            print(f"      错误: {o.error}")
+    print(f"汇总: supported={len(supported)} unsupported={len(unsupported)} "
+          f"failed={len(failed)}")
+    if failed:
+        print("[!] 存在失败动作（协议违规或退出码异常）")
+        return EXIT_FAIL
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
 # 探测公开端点
 # ---------------------------------------------------------------------------
 def cmd_probe_url(args, cfg):
@@ -713,6 +810,20 @@ def build_parser():
     p_sauth = site_subs.add_parser("auth", help="交互式录入长期系统访问令牌")
     p_sauth.add_argument("site", help="站点名称")
 
+    # script
+    p_script = subparsers.add_parser("script", help="站点脚本管理 (new / test)")
+    script_subs = p_script.add_subparsers(dest="subcommand")
+
+    p_snew = script_subs.add_parser("new", help="生成站点脚本模板并切换为 script 适配器")
+    p_snew.add_argument("site", help="站点名称")
+    p_snew.add_argument("--force", action="store_true", help="覆盖已存在的脚本")
+
+    p_stest = script_subs.add_parser("test", help="逐个动作体检站点脚本")
+    p_stest.add_argument("site", help="站点名称")
+    p_stest.add_argument("--action", choices=list(rscript.ACTIONS),
+                         help="只测试指定动作（默认全部）")
+    p_stest.add_argument("--json", action="store_true", help="输出 JSON 格式")
+
     # probe-url
     p_purl = subparsers.add_parser("probe-url", help="只探测公开端点识别面板（不鉴权、不请求定价）")
     p_purl.add_argument("address", help="站点地址 (http(s)://... 或 域名)")
@@ -751,6 +862,9 @@ def build_parser():
     p_daemon.add_argument("--once", action="store_true", help="只刷新当前到期的站点后退出")
     p_daemon.add_argument("--json", action="store_true", help="输出 JSON 格式")
 
+    # 顶层 parser 上挂一份子命令 parser 映射（未知子命令时打印对应帮助）
+    parser.help_parsers = {"key": p_key, "site": p_site, "import": p_import,
+                           "script": p_script}
     return parser, p_key, p_site, p_import
 
 
@@ -842,6 +956,13 @@ def main(argv=None):
             if args.subcommand == "auth":
                 return cmd_site_auth(args, cfg)
             p_site.print_help()
+            return EXIT_USAGE
+        if args.command == "script":
+            if args.subcommand == "new":
+                return cmd_script_new(args, cfg)
+            if args.subcommand == "test":
+                return cmd_script_test(args, cfg)
+            parser.help_parsers["script"].print_help()
             return EXIT_USAGE
         if args.command == "import":
             if args.subcommand == "sites":

@@ -35,6 +35,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # 实时拉取失败且存在旧缓存时，返回旧数据并标记 stale（无旧缓存才报错）
         "serve_stale": True,
     },
+    "script": {
+        # 站点脚本（adapter=script）单次调用的超时（秒）
+        "timeout": 15,
+    },
     "scheduler": {
         # 全局并发 worker 数（每站同一时刻仍最多 1 个刷新任务）
         "max_workers": 4,
@@ -54,7 +58,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
 }
 
-GLOBAL_KEYS = ("version", "proxy", "refresh_interval", "cache", "scheduler", "web")
+GLOBAL_KEYS = ("version", "proxy", "refresh_interval", "cache", "script", "scheduler", "web")
 
 # ---------------------------------------------------------------------------
 # 站点默认配置
