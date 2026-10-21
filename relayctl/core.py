@@ -4,7 +4,8 @@ v2: 路径与安全写盘统一由 paths 模块提供；本模块保留旧名称
 ensure_secure_dir / mask_key / AuthError / load_config / save_config）以兼容旧调用方。
 """
 
-from typing import Optional
+import re
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import requests
@@ -163,6 +164,30 @@ class HttpClient:
 
     def delete(self, path: str, **kwargs) -> requests.Response:
         return self.request("DELETE", path, **kwargs)
+
+
+_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+
+
+def normalize_base(url: Any) -> str:
+    """规范化站点地址：补 https://、去掉末尾 / 与 /v1（可叠加）。
+
+    用于 import 的 base 归一，也是「按 base 匹配已登记站点」的比较基准。
+    """
+    if url is None:
+        return ""
+    s = str(url).strip().strip('"').strip("'").strip()
+    if not s:
+        return ""
+    if not _SCHEME_RE.match(s):
+        s = "https://" + s
+    while True:
+        stripped = s.rstrip("/")
+        if stripped.lower().endswith("/v1"):
+            stripped = stripped[: -len("/v1")]
+        if stripped == s:
+            return s
+        s = stripped
 
 
 def print_table(headers: list, rows: list):
