@@ -1,0 +1,21 @@
+[Unit]
+Description=relayctl background cache refresh daemon
+Documentation=https://github.com/Linyesantan/relayctl
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# %h 由 systemd 展开为当前用户家目录，示例不含任何个人信息
+ExecStart=%h/.local/bin/relayctl daemon
+Environment=RELAYCTL_HOME=%h/.config/relayctl
+WorkingDirectory=%h
+Restart=on-failure
+RestartSec=10s
+# 只让属主访问：RELAYCTL_HOME 下的凭据 / 缓存 / 日志一律 0600/0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

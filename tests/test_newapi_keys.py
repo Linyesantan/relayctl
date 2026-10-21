@@ -1,7 +1,10 @@
 import json
+import os
+import tempfile
 import unittest
 from unittest.mock import Mock
 
+from relayctl import cache as rcache
 from relayctl.adapters.base import NotSupported
 from relayctl.adapters.newapi import NewAPIAdapter
 from relayctl.models import KEY_FIELDS
@@ -115,6 +118,93 @@ class ListKeysOutputTests(unittest.TestCase):
         self.assertEqual(keys[1]["status"], 2)
         self.assertTrue(keys[2]["unlimited"])
         self.assertEqual(keys[2]["remain"], "无限")
+
+
+class ProbeReuseTests(unittest.TestCase):
+    """probe 结果可缓存复用：同一实例 probe 一次，跨实例从 probe 缓存恢复配额底数。"""
+
+    def setUp(self):
+        from unittest import mock
+        self.tmp = tempfile.mkdtemp()
+        self._env = mock.patch.dict(os.environ, {"RELAYCTL_HOME": self.tmp})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+
+    def _adapter(self, base="http://example"):
+        return NewAPIAdapter("t", {"base": base, "adapter": "newapi", "auth": {}}, {})
+
+    def _client(self, unit=500000):
+        calls = {"n": 0}
+
+        def get(path, **kwargs):
+            if path == "/api/status":
+                calls["n"] += 1
+                return Resp({"data": {"system_name": "New API", "version": "v1.0.0",
+                                      "quota_per_unit": unit,
+                                      "quota_display_type": "USD"}})
+            if path in ("/api/user/self", "/api/v1/user/profile"):
+                return Resp({"success": True, "data": {"quota": 1000000, "used_quota": 500000,
+                                                       "group": "default"}})
+            if path.startswith("/api/token/"):
+                return Resp({"success": True, "data": {"items": [], "total": 0}})
+            return Resp({}, status=404)
+
+        client = Mock()
+        client.get.side_effect = get
+        client.calls = calls
+        return client
+
+    def test_same_instance_probes_only_once(self):
+        a = self._adapter()
+        client = self._client()
+        a.client = client
+        real_probe = a.probe
+        a.probe = Mock(side_effect=real_probe)
+
+        a.balance()
+        a.list_keys()
+        self.assertEqual(a.probe.call_count, 1)
+        self.assertTrue(a._probed)
+
+    def test_quota_per_unit_is_restored_from_probe_cache(self):
+        rcache.write("t", "probe", {"site": "t", "system_name": "New API",
+                                    "version": "v1.0.0", "quota_per_unit": 250000,
+                                    "quota_display_type": "CNY", "status_ok": True})
+        a = self._adapter()
+        a.client = self._client(unit=500000)
+        a.probe = Mock(side_effect=RuntimeError("网络被禁用"))
+
+        data = a.balance()
+        a.probe.assert_not_called()
+        self.assertEqual(data["quota_per_unit"], 250000)
+        self.assertEqual(data["display_type"], "CNY")
+        self.assertEqual(data["balance"], "4.0000")  # 1000000 / 250000
+
+    def test_failed_probe_cache_never_unlocks_quota_writes(self):
+        """探测都没成功的缓存里的 quota_per_unit 不可信，额度写操作必须继续被挡。"""
+        a = self._adapter()
+        a.client = Mock()                       # 绝不真的打网络
+        a.probe = Mock(side_effect=RuntimeError("网络不可用"))
+        rcache.write("t", "probe", {"site": "t", "quota_per_unit": 250000,
+                                    "status_ok": False, "status_error": "connection refused"})
+        a._ensure_probed()
+        self.assertFalse(a._quota_unit_known)
+        self.assertNotEqual(a.quota_per_unit, 250000)
+        with self.assertRaises(NotSupported):
+            a._ensure_quota_unit()
+
+    def test_probe_cache_result_is_used_by_cli_flow(self):
+        """probe 走缓存：CLI 第二次取 probe 不再打网络。"""
+        a = self._adapter()
+        a.client = self._client()
+        probe_data, meta = rcache.fetch("t", "probe", a.probe, rcache.MODE_REFRESH)
+        self.assertFalse(meta["from_cache"])
+        self.assertEqual(probe_data["quota_per_unit"], 500000)
+
+        again, meta2 = rcache.fetch("t", "probe", a.probe, rcache.MODE_AUTO)
+        self.assertTrue(meta2["from_cache"])
+        self.assertEqual(again["quota_per_unit"], 500000)
+        self.assertEqual(meta["fetched_at"], meta2["fetched_at"])
 
 
 class GroupsTests(unittest.TestCase):

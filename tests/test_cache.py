@@ -59,13 +59,61 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(d, [{"id": 1}])
         self.assertEqual(self.calls, 1)
 
-    def test_failed_pull_keeps_old_cache(self):
-        rcache.fetch("s", "balance", self._fn({"balance": 1}), rcache.MODE_AUTO)
+    def test_failed_pull_keeps_old_cache_and_marks_stale(self):
+        old, old_meta = rcache.fetch("s", "balance", self._fn({"balance": 1}), rcache.MODE_AUTO)
+
         def boom():
             raise RuntimeError("down")
+
+        # 强刷失败但有旧缓存：返回旧 data，保留 fetched_at，并标记 stale / last_error
+        data, meta = rcache.fetch("s", "balance", boom, rcache.MODE_REFRESH)
+        self.assertEqual(data, {"balance": 1})
+        self.assertTrue(meta["from_cache"])
+        self.assertTrue(meta["stale"])
+        self.assertIn("RuntimeError: down", meta["last_error"])
+        self.assertEqual(meta["fetched_at"], old_meta["fetched_at"])
+
+        # stale 标记必须落盘
+        ent = rcache.read("s", "balance")
+        self.assertTrue(ent["stale"])
+        self.assertTrue(ent["last_error"])
+        self.assertEqual(ent["data"], {"balance": 1})
+        self.assertEqual(ent["fetched_at"], old_meta["fetched_at"])
+
+        # 没有旧缓存时才允许抛错
+        rcache.invalidate("s")
         with self.assertRaises(RuntimeError):
             rcache.fetch("s", "balance", boom, rcache.MODE_REFRESH)
+
+        # 一次成功刷新必须清掉 stale / last_error
+        d2, meta2 = rcache.fetch("s", "balance", self._fn({"balance": 2}), rcache.MODE_REFRESH)
+        self.assertEqual(d2, {"balance": 2})
+        self.assertFalse(meta2["from_cache"])
+        self.assertFalse(meta2["stale"])
+        self.assertIsNone(meta2["last_error"])
+        self.assertFalse(rcache.read("s", "balance")["stale"])
+
+    def test_serve_stale_can_be_disabled(self):
+        rcache.fetch("s", "balance", self._fn({"balance": 1}), rcache.MODE_AUTO)
+
+        def boom():
+            raise RuntimeError("down")
+
+        with self.assertRaises(RuntimeError):
+            rcache.fetch("s", "balance", boom, rcache.MODE_REFRESH, serve_stale=False)
         self.assertEqual(rcache.read("s", "balance")["data"], {"balance": 1})
+        self.assertFalse(rcache.read("s", "balance")["stale"])
+
+    def test_last_error_is_redacted(self):
+        rcache.fetch("s", "balance", self._fn({"balance": 1}), rcache.MODE_AUTO)
+
+        def boom():
+            raise RuntimeError("HTTP 401 from https://x.example.com: sk-SECRET123456789 token=abc")
+
+        self.assertEqual(rcache.fetch("s", "balance", boom, rcache.MODE_REFRESH)[0],
+                         {"balance": 1})
+        ent = rcache.read("s", "balance")
+        self.assertNotIn("SECRET123456789", json.dumps(ent, ensure_ascii=False))
 
     def test_raw_keys_never_hit_disk(self):
         keys = [{"id": 1, "key": "sk-REALSECRET123456", "_raw_key": "sk-REALSECRET123456",

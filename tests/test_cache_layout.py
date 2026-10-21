@@ -70,15 +70,25 @@ class CacheLayoutTests(unittest.TestCase):
         rcache.invalidate("s")
         self.assertFalse(os.path.exists(rcache.cache_path("s")))
 
-    def test_failed_pull_keeps_previous_cache(self):
+    def test_failed_pull_keeps_previous_cache_and_marks_stale(self):
         rcache.write("s", "groups", [{"name": "default"}])
+        fetched_at = rcache.read("s", "groups")["fetched_at"]
 
         def boom():
             raise RuntimeError("upstream down")
 
-        with self.assertRaises(RuntimeError):
-            rcache.fetch("s", "groups", boom, rcache.MODE_REFRESH)
-        self.assertEqual(rcache.read("s", "groups")["data"], [{"name": "default"}])
+        data, meta = rcache.fetch("s", "groups", boom, rcache.MODE_REFRESH)
+        self.assertEqual(data, [{"name": "default"}])
+        self.assertTrue(meta["from_cache"])
+        self.assertTrue(meta["stale"])
+        self.assertEqual(meta["fetched_at"], fetched_at)
+
+        ent = rcache.read("s", "groups")
+        self.assertTrue(ent["stale"])
+        self.assertIn("RuntimeError", ent["last_error"])
+        self.assertEqual(ent["fetched_at"], fetched_at)
+        # 权限不能被 stale 更新破坏
+        self.assertEqual(stat.S_IMODE(os.stat(rcache.cache_path("s")).st_mode), 0o600)
 
 
 if __name__ == "__main__":

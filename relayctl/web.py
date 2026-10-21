@@ -6,13 +6,18 @@ relayctl Web Dashboard: 适配移动端与桌面端的轻量双端管理面板
 
 import sys, os, json, urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from typing import Optional
+from typing import Any, Optional
 
 # 引入核心模块
 from . import models
 from .core import load_config
 from . import cache as rcache
 from .adapters import get_adapter
+
+# Web 内置调度器工厂（测试可替换 / 禁用）
+_SCHEDULER_FACTORY = None
+# 当前 run_web 托管的调度器（便于测试断言生命周期）
+_WEB_SCHEDULER = None
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -560,21 +565,75 @@ class RelayctlWebHandler(BaseHTTPRequestHandler):
 
         self._send_json({"error": "Not Found"}, 404)
 
-def run_web(host: str = "127.0.0.1", port: int = 8088, config_override: Optional[dict] = None):
+# ---------------------------------------------------------------------------
+# Web 内置后台调度器：随 server 启停，绝不由 Web 请求各自创建
+# ---------------------------------------------------------------------------
+def scheduler_enabled(cfg: Optional[dict], override: Optional[bool] = None) -> bool:
+    """是否随 Web 拉起后台刷新调度（config.web.scheduler_enabled，默认 true）。"""
+    if override is not None:
+        return bool(override)
+    web_cfg = (cfg or {}).get("web") or {}
+    return bool(web_cfg.get("scheduler_enabled", True))
+
+
+def start_background_scheduler(cfg: Optional[dict] = None, enabled: Optional[bool] = None,
+                               factory: Any = None) -> Any:
+    """启动后台刷新调度线程；返回 Scheduler，未启用则返回 None。
+
+    线程由 Scheduler 自己以 daemon=True 创建，进程退出不会被它阻塞。
+    """
+    from .config import load_config
+    from .scheduler import Scheduler
+    cfg = cfg if cfg is not None else load_config()
+    if not scheduler_enabled(cfg, enabled):
+        return None
+    builder = factory or _SCHEDULER_FACTORY or Scheduler
+    scheduler = builder(cfg)
+    if scheduler is None:
+        return None
+    scheduler.start()
+    return scheduler
+
+
+def stop_background_scheduler(scheduler: Any, timeout: float = 5.0):
+    """关闭 server 时 stop + join 后台调度线程。"""
+    if scheduler is None:
+        return
+    try:
+        scheduler.stop(timeout)
+    except Exception:  # noqa: BLE001 - 关闭阶段的异常不应影响 Web 退出
+        pass
+
+
+def run_web(host: str = "127.0.0.1", port: int = 8088,
+            config_override: Optional[dict] = None,
+            scheduler_enabled: Optional[bool] = None):
     """启动 relayctl Web 服务（默认只监听回环地址；完整鉴权在阶段 6）。"""
-    RelayctlWebHandler.config = config_override or load_config()
+    global _WEB_SCHEDULER
+    cfg = config_override or load_config()
+    # 后台调度器在 server 之前启动、在 server 关闭之后停止（Web 请求绝不自建调度器）
+    _WEB_SCHEDULER = start_background_scheduler(cfg, enabled=scheduler_enabled)
+
+    RelayctlWebHandler.config = cfg
     server_address = (host, port)
     httpd = HTTPServer(server_address, RelayctlWebHandler)
     print(f"[*] relayctl Web 控制台已启动: http://{host}:{port}/")
     print("    支持手机浏览器 (触控适配卡片流) 与桌面浏览器 (宽屏仪表盘)")
     if host not in ("127.0.0.1", "localhost", "::1"):
         print(f"[!] 警告: 当前监听 {host}，将暴露到非回环网络且尚未启用访问鉴权")
+    if _WEB_SCHEDULER is not None:
+        print("    内置后台刷新调度已随控制台启动。")
     print("    按 Ctrl+C 停止服务。")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\n[*] relayctl Web 服务已停止。")
-        httpd.server_close()
+    finally:
+        try:
+            httpd.server_close()
+        finally:
+            stop_background_scheduler(_WEB_SCHEDULER)
+            _WEB_SCHEDULER = None
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8088

@@ -26,21 +26,35 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "version": 2,
     # 全局默认代理策略: none(直连) / auto(跟随系统环境变量) / http://host:port
     "proxy": "none",
-    # 默认刷新间隔
+    # 默认刷新间隔（s/m/h/d，如 30m / 1h / 1d）；站点级 refresh_interval 可覆盖
     "refresh_interval": "30m",
     "cache": {
         "enabled": True,
         "mode": "auto",      # auto: 有缓存就用；refresh: 强制实时；cached: 只读缓存
         "ttl": "30m",
+        # 实时拉取失败且存在旧缓存时，返回旧数据并标记 stale（无旧缓存才报错）
+        "serve_stale": True,
+    },
+    "scheduler": {
+        # 全局并发 worker 数（每站同一时刻仍最多 1 个刷新任务）
+        "max_workers": 4,
+        # 成功后的下一次间隔抖动比例（±jitter）
+        "jitter": 0.1,
+        # 失败退避初始值 / 倍数 / 上限（秒）
+        "backoff_initial": 60,
+        "backoff_factor": 2,
+        "backoff_max": 1800,
     },
     "web": {
         "host": "127.0.0.1",
         "port": 8088,
         "access_password": "",   # 空 = 不启用鉴权（完整 Web 鉴权在阶段 6）
+        # 是否在 run_web 内一并拉起后台刷新调度线程
+        "scheduler_enabled": True,
     },
 }
 
-GLOBAL_KEYS = ("version", "proxy", "refresh_interval", "cache", "web")
+GLOBAL_KEYS = ("version", "proxy", "refresh_interval", "cache", "scheduler", "web")
 
 # ---------------------------------------------------------------------------
 # 站点默认配置

@@ -32,12 +32,30 @@ from relayctl import cache as rcache  # noqa: E402
 
 
 def cache_note(meta) -> str:
-    """标注数据的最新更新时间。"""
+    """标注数据的最新更新时间；stale 时额外给出警告与上次错误（脱敏）。"""
     if not meta:
         return ""
     if meta.get("from_cache"):
-        return f"最新更新时间: {meta.get('fetched_at')}（缓存，{rcache.age_text(meta['ts'])}；--refresh 重新拉取）"
-    return f"最新更新时间: {meta.get('fetched_at')}（刚刚实时拉取）"
+        lines = [f"最新更新时间: {meta.get('fetched_at')}（缓存，"
+                 f"{rcache.age_text(meta['ts'])}；--refresh 重新拉取）"]
+    else:
+        lines = [f"最新更新时间: {meta.get('fetched_at')}（刚刚实时拉取）"]
+    if meta.get("stale"):
+        lines.append("[!] 本次实时拉取失败，以下为上一次成功的数据（stale）")
+        if meta.get("last_error"):
+            lines.append(f"    上次错误: {meta['last_error']}")
+    return "\n".join(lines)
+
+
+def print_updates(notes: "list"):
+    """统一打印各站点/分段的更新时间与 stale 警告（多行即多条信息）。"""
+    lines = [line for note in notes for line in str(note or "").splitlines()]
+    lines = [l for l in lines if l.strip()]
+    if not lines:
+        return
+    print("")
+    for line in lines:
+        print(line)
 
 
 def _site(cfg: dict, name: str):
@@ -65,6 +83,7 @@ def cmd_balance(args, cfg):
 def cmd_status(args, cfg):
     sites = cfg.get("sites", {})
     c_mode = rcache.mode_from_args(args)
+    notes = []
 
     if args.json:
         result = {}
@@ -94,6 +113,9 @@ def cmd_status(args, cfg):
                     "key_count": key_count,
                     "keys_error": keys_error,
                     "from_cache": b_meta["from_cache"],
+                    "fetched_at": b_meta.get("fetched_at"),
+                    "stale": bool(b_meta.get("stale")),
+                    "last_error": b_meta.get("last_error"),
                 }
             except AuthError as ae:
                 result[name] = {"tier": tier, "error": f"鉴权失败: {ae}"}
@@ -113,7 +135,8 @@ def cmd_status(args, cfg):
             continue
         try:
             adapter = get_adapter(name, s_cfg, cfg)
-            b, _ = rcache.fetch(name, "balance", adapter.balance, c_mode)
+            b, b_meta = rcache.fetch(name, "balance", adapter.balance, c_mode)
+            notes.append(f"  - {name}: {cache_note(b_meta)}")
             bal = str(b.get("balance", "-"))
             used = str(b.get("used", "-"))
             group = b.get("user_group", "-")
@@ -130,10 +153,13 @@ def cmd_status(args, cfg):
             rows.append([name, tier, "-", "-", "-", "-", "-", f"鉴权失效 ({ae})"])
         except NotSupported as ns:
             rows.append([name, tier, "-", "-", "-", "-", "-", str(ns)])
+        except rcache.CacheMiss as cm:
+            rows.append([name, tier, "-", "-", "-", "-", "-", str(cm)])
         except Exception as e:
             rows.append([name, tier, "-", "-", "-", "-", "-", f"异常: {e}"])
 
     print_table(headers, rows)
+    print_updates(notes)
     return EXIT_OK
 
 
@@ -146,13 +172,17 @@ def cmd_probe(args, cfg):
         _site(cfg, target)
         check_list = [target]
 
+    # 探测也优先读缓存（--refresh 才真正请求生产环境）
+    p_mode = rcache.mode_from_args(args)
+    notes = []
     headers = ["站点", "识别系统", "版本", "鉴权状态", "配额底数", "计费币种", "诊断"]
     rows = []
     for name in check_list:
         s_cfg = sites[name]
         try:
             adapter = get_adapter(name, s_cfg, cfg)
-            p = adapter.probe()
+            p, p_meta = rcache.fetch(name, "probe", adapter.probe, p_mode)
+            notes.append(f"  - {name}: {cache_note(p_meta)}")
             auth_str = "有效" if p.get("auth_ok") else f"失效 ({p.get('auth_status')})"
             rows.append([
                 name,
@@ -165,10 +195,13 @@ def cmd_probe(args, cfg):
             ])
         except NotSupported as ns:
             rows.append([name, "已搁置", "-", "-", "-", "-", str(ns)])
+        except rcache.CacheMiss as cm:
+            rows.append([name, "无缓存", "-", "-", "-", "-", str(cm)])
         except Exception as e:
             rows.append([name, "探测异常", "-", str(e), "-", "-", str(e)])
 
     print_table(headers, rows)
+    print_updates(notes)
     return EXIT_OK
 
 
@@ -176,8 +209,8 @@ def cmd_groups(args, cfg):
     s_cfg = _site(cfg, args.site)
     adapter = get_adapter(args.site, s_cfg, cfg)
     g_list, meta = rcache.fetch(args.site, "groups", adapter.groups, rcache.mode_from_args(args))
-    if meta.get("from_cache"):
-        print(cache_note(meta))
+    print(cache_note(meta))
+    print("")
     headers = ["分组名称", "说明", "倍率"]
     rows = [[g.get("name", ""), g.get("desc", ""), str(g.get("ratio", ""))] for g in g_list]
     print_table(headers, rows)
@@ -188,8 +221,8 @@ def cmd_keys(args, cfg):
     s_cfg = _site(cfg, args.site)
     adapter = get_adapter(args.site, s_cfg, cfg)
     k_list, meta = rcache.fetch(args.site, "keys", adapter.list_keys, rcache.mode_from_args(args))
-    if meta.get("from_cache"):
-        print(cache_note(meta))
+    print(cache_note(meta))
+    print("")
     headers = ["ID", "名称", "分组", "状态", "无限", "剩余额度", "已用额度", "模型", "Key (脱敏)"]
     rows = []
     for k in k_list:
@@ -559,6 +592,34 @@ def cmd_web(args, cfg):
     return EXIT_OK
 
 
+# ---------------------------------------------------------------------------
+# 后台刷新守护 (relayctl daemon)
+# ---------------------------------------------------------------------------
+def cmd_daemon(args, cfg):
+    from relayctl import scheduler as rsched
+    from relayctl.paths import logs_dir
+
+    sched = rsched.Scheduler(cfg)
+
+    if args.once:
+        report = sched.run_once()
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        else:
+            for line in rsched.daemon_report_lines(report):
+                print(line)
+        return EXIT_OK if not report["summary"]["failed"] else EXIT_FAIL
+
+    log_path = os.path.join(logs_dir(), rsched.LOG_NAME)
+    print(f"[*] relayctl daemon 已启动（日志: {log_path}），按 Ctrl+C 停止。")
+    try:
+        sched.serve_forever()
+    finally:
+        sched.stop()
+    print("[*] relayctl daemon 已停止。")
+    return EXIT_OK
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="relayctl",
@@ -581,6 +642,8 @@ def build_parser():
     # probe
     p_probe = subparsers.add_parser("probe", help="探测站点健康度与鉴权有效性")
     p_probe.add_argument("site", help="站点名称，或传 'all'")
+    p_probe.add_argument("--refresh", action="store_true", help="强制从上游重新拉取")
+    p_probe.add_argument("--cached", action="store_true", help="只读本地缓存，不发网络请求")
 
     # groups
     p_groups = subparsers.add_parser("groups", help="查看指定站点的可用模型分组")
@@ -683,6 +746,11 @@ def build_parser():
     p_web.add_argument("--host", default=None, help="监听地址 (默认 127.0.0.1)")
     p_web.add_argument("--port", type=int, default=None, help="监听端口 (默认 8088)")
 
+    # daemon
+    p_daemon = subparsers.add_parser("daemon", help="后台定时刷新站点缓存 (systemd user 常驻)")
+    p_daemon.add_argument("--once", action="store_true", help="只刷新当前到期的站点后退出")
+    p_daemon.add_argument("--json", action="store_true", help="输出 JSON 格式")
+
     return parser, p_key, p_site, p_import
 
 
@@ -745,6 +813,7 @@ def main(argv=None):
         "keys": cmd_keys,
         "migrate": cmd_migrate,
         "web": cmd_web,
+        "daemon": cmd_daemon,
     }
 
     try:

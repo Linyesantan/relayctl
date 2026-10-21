@@ -86,6 +86,26 @@ class GlobalConfigTests(HomeTestMixin, unittest.TestCase):
         self.assertEqual(cfg["web"]["port"], 8088)
         self.assertEqual(cfg["web"]["access_password"], "")
 
+    def test_defaults_include_cache_and_scheduler_policy(self):
+        cfg = config.load_global()
+        self.assertTrue(cfg["cache"]["serve_stale"])
+        self.assertEqual(cfg["scheduler"]["max_workers"], 4)
+        self.assertEqual(cfg["scheduler"]["jitter"], 0.1)
+        self.assertEqual(cfg["scheduler"]["backoff_initial"], 60)
+        self.assertEqual(cfg["scheduler"]["backoff_factor"], 2)
+        self.assertEqual(cfg["scheduler"]["backoff_max"], 1800)
+        self.assertTrue(cfg["web"]["scheduler_enabled"])
+
+    def test_saving_global_keys_preserves_scheduler(self):
+        config.save_global({"proxy": "auto", "web": {"port": 9090}})
+        raw = yaml.safe_load(open(paths.config_path(), encoding="utf-8"))
+        self.assertIn("scheduler", raw)
+        self.assertEqual(raw["scheduler"]["max_workers"], 4)
+        self.assertEqual(raw["scheduler"]["backoff_max"], 1800)
+        reloaded = config.load_global()
+        self.assertEqual(reloaded["proxy"], "auto")
+        self.assertEqual(reloaded["scheduler"]["backoff_factor"], 2)
+
     def test_global_roundtrip_is_private(self):
         config.save_global({"proxy": "auto", "web": {"port": 9090}})
         cfg = config.load_global()

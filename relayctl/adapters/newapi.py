@@ -4,6 +4,7 @@ from typing import Dict, Any, List, Optional
 from .base import BaseAdapter, NotSupported
 from ..core import HttpClient, mask_key, AuthError
 from .. import models
+from .. import cache as rcache
 
 class NewAPIAdapter(BaseAdapter):
     NAME = "newapi"
@@ -15,6 +16,8 @@ class NewAPIAdapter(BaseAdapter):
         self.quota_display_type = "USD"
         self._quota_unit_known = False
         self._probed = False
+        # 同一适配器实例最多真正 probe 一次（失败也不重复打网络）
+        self._probe_attempted = False
 
     def _check_auth_response(self, r, json_data: Optional[dict] = None):
         """检查响应是否鉴权失败，若是则抛出 AuthError"""
@@ -34,7 +37,8 @@ class NewAPIAdapter(BaseAdapter):
             "version": "未知",
             "auth_ok": False,
             "quota_per_unit": 500000,
-            "quota_display_type": "USD"
+            "quota_display_type": "USD",
+            "status_ok": False,
         }
         # 1. 探测 status
         try:
@@ -52,6 +56,7 @@ class NewAPIAdapter(BaseAdapter):
                     result["quota_per_unit"] = 500000
                 result["quota_display_type"] = data.get("quota_display_type", "USD")
                 self.quota_display_type = result["quota_display_type"]
+                result["status_ok"] = True
                 self._probed = True
         except Exception as e:
             result["status_error"] = str(e)
@@ -79,12 +84,53 @@ class NewAPIAdapter(BaseAdapter):
 
         return result
 
+    def _apply_probe(self, result: Optional[dict]) -> bool:
+        """吸收一次 probe 结果里的配额底数信息（不信任其中的鉴权结论）。
+
+        只有在探测确实拿到 /api/status（status_ok）时才认可 quota_per_unit：
+        否则绝不解禁额度写操作，避免用「猜出来的底数」做换算。
+        """
+        if not isinstance(result, dict):
+            return False
+        if not result.get("status_ok"):
+            return False
+        raw_unit = result.get("quota_per_unit")
+        if (isinstance(raw_unit, (int, float)) and not isinstance(raw_unit, bool)
+                and math.isfinite(raw_unit) and raw_unit > 0):
+            self.quota_per_unit = raw_unit
+            self._quota_unit_known = True
+        if result.get("quota_display_type"):
+            self.quota_display_type = result["quota_display_type"]
+        self._probed = True
+        return True
+
+    def _restore_from_probe_cache(self) -> bool:
+        """用本站 probe 缓存恢复 quota_per_unit，避免每次 balance/keys 都重复 probe。
+
+        只读 quota_per_unit / quota_display_type 这类相对稳定的公共信息，
+        鉴权结论不复用（仍旧以实际请求的响应为准）。
+        """
+        try:
+            entry = rcache.read(self.name, "probe")
+        except Exception:  # noqa: BLE001 - 缓存不可读时回退到真实 probe
+            return False
+        if not isinstance(entry, dict):
+            return False
+        return self._apply_probe(entry.get("data"))
+
     def _ensure_probed(self):
-        if not self._probed:
-            try:
-                self.probe()
-            except Exception:
-                pass
+        """保证同一适配器实例最多 probe 一次。"""
+        if self._probed or self._probe_attempted:
+            return
+        if self._restore_from_probe_cache():
+            self._probe_attempted = True
+            return
+        try:
+            self.probe()
+        except Exception:  # noqa: BLE001 - probe 失败由后续请求自行暴露
+            pass
+        finally:
+            self._probe_attempted = True
 
     def _ensure_quota_unit(self):
         self._ensure_probed()
