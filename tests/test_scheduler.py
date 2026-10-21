@@ -396,7 +396,8 @@ class PlanAndRunTests(SchedulerTestBase):
         sched = self.scheduler({"demo": site()})
         with mock.patch.object(rsched, "get_adapter", return_value=adapter):
             sched.run_once()
-        raw = open(rcache.cache_path("demo"), encoding="utf-8").read()
+        with open(rcache.cache_path("demo"), encoding="utf-8") as f:
+            raw = f.read()
         self.assertNotIn("SUPERSECRET", raw)
         # 绝不请求定价/折算端点
         self.assertTrue(client.paths)
@@ -461,7 +462,8 @@ class DaemonLoggerTests(SchedulerTestBase):
         self.assertTrue(os.path.exists(path))
         self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(os.stat(paths.logs_dir()).st_mode), 0o700)
-        content = open(path, encoding="utf-8").read()
+        with open(path, encoding="utf-8") as f:
+            content = f.read()
         self.assertNotIn("SUPERSECRET", content)
         self.assertIn("relayctl", content.lower()) if "relayctl" in content else None
 
@@ -471,7 +473,8 @@ class DaemonLoggerTests(SchedulerTestBase):
             sched.run_once()
         path = os.path.join(paths.logs_dir(), rsched.LOG_NAME)
         self.assertTrue(os.path.exists(path))
-        content = open(path, encoding="utf-8").read()
+        with open(path, encoding="utf-8") as f:
+            content = f.read()
         self.assertIn("demo", content)
 
 

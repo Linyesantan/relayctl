@@ -1,575 +1,365 @@
 #!/usr/bin/env python3
-"""
-relayctl Web Dashboard: 适配移动端与桌面端的轻量双端管理面板
-零额外依赖 (基于 Python 原生 http.server + requests + pyyaml)
-"""
+"""relayctl 零额外依赖 Web 控制台。"""
 
-import sys, os, json, urllib.parse
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import hmac
+import json
+import secrets
+import sys
+import urllib.parse
+from http import cookies
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Optional
 
-# 引入核心模块
-from . import models
-from .core import load_config
 from . import cache as rcache
+from . import models
 from .adapters import get_adapter
+from .config import load_config
+from .doctor import is_loopback
+from .errors import ConfigError
 
-# Web 内置调度器工厂（测试可替换 / 禁用）
 _SCHEDULER_FACTORY = None
-# 当前 run_web 托管的调度器（便于测试断言生命周期）
 _WEB_SCHEDULER = None
 
-HTML_TEMPLATE = r"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>relayctl · 中转管理控制台</title>
-  <style>
-    :root {
-      --bg: #0f172a;
-      --card-bg: rgba(30, 41, 59, 0.7);
-      --card-border: rgba(255, 255, 255, 0.08);
-      --text-main: #f8fafc;
-      --text-muted: #94a3b8;
-      --primary: #38bdf8;
-      --primary-hover: #0ea5e9;
-      --success: #34d399;
-      --warning: #fbbf24;
-      --danger: #f87171;
-      --radius: 14px;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
-    body { background-color: var(--bg); color: var(--text-main); min-height: 100vh; padding: 16px; -webkit-tap-highlight-color: transparent; }
-    .container { max-width: 1200px; margin: 0 auto; }
-    
-    /* Header */
-    header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 12px; }
-    .brand { display: flex; align-items: center; gap: 10px; }
-    .brand-icon { width: 36px; height: 36px; background: linear-gradient(135deg, #38bdf8, #818cf8); border-radius: 10px; display: flex; align-items: center; justify-content: center; font-weight: bold; color: #fff; font-size: 18px; box-shadow: 0 4px 12px rgba(56, 189, 248, 0.3); }
-    .brand-title { font-size: 20px; font-weight: 700; letter-spacing: -0.5px; }
-    .brand-subtitle { font-size: 12px; color: var(--text-muted); }
-    
-    .actions { display: flex; gap: 8px; align-items: center; }
-    .btn { background: var(--card-bg); border: 1px solid var(--card-border); color: var(--text-main); padding: 8px 14px; border-radius: 8px; font-size: 13px; font-weight: 500; cursor: pointer; transition: all 0.2s; display: inline-flex; align-items: center; gap: 6px; }
-    .btn:hover { background: rgba(51, 65, 85, 0.8); border-color: rgba(255, 255, 255, 0.2); }
-    .btn-primary { background: linear-gradient(135deg, #0284c7, #2563eb); border: none; color: #fff; }
-    .btn-primary:hover { opacity: 0.9; }
-    .btn-sm { padding: 4px 10px; font-size: 12px; border-radius: 6px; }
-    
-    /* Metrics */
-    .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 20px; }
-    .metric-card { background: var(--card-bg); border: 1px solid var(--card-border); backdrop-filter: blur(12px); border-radius: var(--radius); padding: 14px; }
-    .metric-label { font-size: 12px; color: var(--text-muted); margin-bottom: 4px; }
-    .metric-value { font-size: 24px; font-weight: 700; }
-    
-    /* Search & Filter Toolbar */
-    .toolbar { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
-    .search-input { flex: 1; min-width: 200px; background: var(--card-bg); border: 1px solid var(--card-border); color: var(--text-main); padding: 9px 14px; border-radius: 8px; font-size: 13px; outline: none; }
-    .search-input:focus { border-color: var(--primary); }
-    
-    /* Cards Layout (Mobile-first friendly) */
-    .cards-container { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
-    .site-card { background: var(--card-bg); border: 1px solid var(--card-border); backdrop-filter: blur(12px); border-radius: var(--radius); padding: 16px; display: flex; flex-direction: column; justify-content: space-between; transition: transform 0.2s, box-shadow 0.2s; }
-    .site-card:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(0,0,0,0.3); border-color: rgba(255, 255, 255, 0.15); }
-    
-    .card-head { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px; }
-    .site-name { font-size: 16px; font-weight: 700; color: var(--primary); display: flex; align-items: center; gap: 6px; }
-    .badge { font-size: 11px; padding: 2px 8px; border-radius: 12px; font-weight: 600; text-transform: uppercase; }
-    .badge-api { background: rgba(52, 211, 153, 0.15); color: var(--success); border: 1px solid rgba(52, 211, 153, 0.3); }
-    .badge-parked { background: rgba(251, 191, 36, 0.15); color: var(--warning); border: 1px solid rgba(251, 191, 36, 0.3); }
-    
-    .card-body { font-size: 13px; margin-bottom: 14px; line-height: 1.6; }
-    .info-row { display: flex; justify-content: space-between; margin-bottom: 4px; }
-    .info-label { color: var(--text-muted); }
-    .info-value { font-weight: 500; }
-    .balance-val { color: var(--success); font-weight: 700; font-size: 15px; }
-    
-    .card-footer { display: flex; gap: 6px; border-top: 1px solid rgba(255,255,255,0.06); padding-top: 12px; flex-wrap: wrap; }
-    
-    /* Modal / Bottom Sheet */
-    .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); backdrop-filter: blur(4px); z-index: 1000; display: none; align-items: center; justify-content: center; padding: 16px; }
-    .modal-content { background: #1e293b; border: 1px solid var(--card-border); border-radius: var(--radius); max-width: 600px; width: 100%; max-height: 85vh; overflow-y: auto; padding: 20px; box-shadow: 0 20px 40px rgba(0,0,0,0.5); }
-    .modal-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
-    .modal-title { font-size: 18px; font-weight: 700; }
-    .modal-close { background: transparent; border: none; color: var(--text-muted); font-size: 22px; cursor: pointer; }
-    
-    /* Table inside modal */
-    .pure-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 10px; }
-    .pure-table th, .pure-table td { padding: 8px 10px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.08); }
-    .pure-table th { color: var(--text-muted); font-weight: 600; }
-    .key-badge { font-family: monospace; background: rgba(0,0,0,0.3); padding: 2px 6px; border-radius: 4px; font-size: 11px; }
+MAX_BODY_BYTES = 64 * 1024
+SESSION_COOKIE = "relayctl_session"
 
-    /* Form styles */
-    .form-group { margin-bottom: 12px; }
-    .form-label { display: block; font-size: 12px; color: var(--text-muted); margin-bottom: 4px; }
-    .form-input { width: 100%; background: #0f172a; border: 1px solid var(--card-border); color: var(--text-main); padding: 8px 12px; border-radius: 6px; font-size: 13px; }
-    
-    @media (max-width: 640px) {
-      body { padding: 10px; }
-      .modal-overlay { align-items: flex-end; padding: 0; }
-      .modal-content { border-radius: var(--radius) var(--radius) 0 0; max-height: 90vh; }
-      .cards-container { grid-template-columns: 1fr; }
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <header>
-      <div class="brand">
-        <div class="brand-icon">R</div>
-        <div>
-          <div class="brand-title">relayctl 控制台</div>
-          <div class="brand-subtitle">多上游中转站 Key 与余额统一管理</div>
-        </div>
-      </div>
-      <div class="actions">
-        <button class="btn btn-primary" onclick="loadStatus(true)">⚡ 刷新状态</button>
-      </div>
-    </header>
+LOGIN_TEMPLATE = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>relayctl 登录</title><style>
+body{font-family:sans-serif;max-width:28rem;margin:5rem auto;padding:1rem;background:#0f172a;color:#f8fafc}
+form{display:grid;gap:.8rem}input,button{font:inherit;padding:.7rem;border-radius:.4rem;border:1px solid #475569}
+button{cursor:pointer;background:#0284c7;color:white}</style></head><body>
+<h1>relayctl</h1><p>请输入 Web 访问口令。</p>
+<form method="post" action="/login"><label for="password">访问口令</label>
+<input id="password" name="password" type="password" autocomplete="current-password" required>
+<button type="submit">登录</button></form></body></html>"""
 
-    <!-- Metrics -->
-    <div class="metrics-grid">
-      <div class="metric-card">
-        <div class="metric-label">纳管站点总数</div>
-        <div class="metric-value" id="stat-total">-</div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-label">活跃 API 站点</div>
-        <div class="metric-value" style="color: var(--success);" id="stat-api">-</div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-label">搁置 / 受限站点</div>
-        <div class="metric-value" style="color: var(--warning);" id="stat-parked">-</div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-label">监控总余额</div>
-        <div class="metric-value" style="color: var(--primary);" id="stat-balance">-</div>
-      </div>
-    </div>
+HTML_TEMPLATE = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>relayctl 控制台</title><style>
+:root{color-scheme:dark}body{font-family:system-ui,sans-serif;margin:0;padding:1rem;background:#0f172a;color:#f8fafc}
+main{max-width:70rem;margin:auto}.toolbar{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap}
+button,input{font:inherit;padding:.55rem;border-radius:.4rem;border:1px solid #475569}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(18rem,1fr));gap:.8rem;margin-top:1rem}
+.card,.panel{background:#1e293b;border:1px solid #334155;border-radius:.7rem;padding:1rem}.muted{color:#94a3b8}
+table{width:100%;border-collapse:collapse}td,th{text-align:left;border-bottom:1px solid #334155;padding:.4rem}
+#details{margin-top:1rem;overflow:auto}</style></head><body><main>
+<div class="toolbar"><h1>relayctl 控制台</h1><button id="refresh" type="button">刷新状态</button><button id="logout" type="button">退出</button></div>
+<p id="message" class="muted">正在加载…</p><section id="sites" class="grid"></section><section id="details" class="panel" hidden></section>
+</main><script>
+'use strict';
+const sitesNode=document.getElementById('sites');
+const detailsNode=document.getElementById('details');
+const messageNode=document.getElementById('message');
+async function request(path, options={}){
+  const response=await fetch(path,{credentials:'same-origin',...options});
+  const body=await response.json();
+  if(!response.ok) throw new Error(body.message||'请求失败');
+  return body;
+}
+function clear(node){while(node.firstChild)node.removeChild(node.firstChild);}
+function element(tag,text,className){const node=document.createElement(tag);if(text!==undefined)node.textContent=String(text);if(className)node.className=className;return node;}
+function addButton(parent,label,handler){const button=element('button',label);button.type='button';button.addEventListener('click',handler);parent.appendChild(button);}
+function showTable(title,rows,columns){clear(detailsNode);detailsNode.hidden=false;detailsNode.appendChild(element('h2',title));const table=element('table');const head=element('tr');columns.forEach(c=>head.appendChild(element('th',c.label)));const thead=element('thead');thead.appendChild(head);table.appendChild(thead);const tbody=element('tbody');rows.forEach(row=>{const tr=element('tr');columns.forEach(c=>tr.appendChild(element('td',row[c.key]??'-')));tbody.appendChild(tr);});table.appendChild(tbody);detailsNode.appendChild(table);}
+async function showKeys(name){try{const body=await request('/api/keys/'+encodeURIComponent(name));showTable(name+' · Key',body.data||[],[{key:'name',label:'名称'},{key:'group',label:'分组'},{key:'key_masked',label:'Key（脱敏）'}]);}catch(error){messageNode.textContent=error.message;}}
+async function showGroups(name){try{const body=await request('/api/groups/'+encodeURIComponent(name));showTable(name+' · 分组',body.data||[],[{key:'name',label:'名称'},{key:'ratio',label:'倍率'},{key:'desc',label:'说明'}]);}catch(error){messageNode.textContent=error.message;}}
+function renderSites(items){clear(sitesNode);items.forEach(site=>{const card=element('article',undefined,'card');card.appendChild(element('h2',site.name));card.appendChild(element('p','状态：'+site.tier));card.appendChild(element('p','余额：'+site.balance+' '+(site.display_type||'')));card.appendChild(element('p','分组：'+(site.group||'-')));if(site.diagnosis)card.appendChild(element('p',site.diagnosis,'muted'));const actions=element('div','', 'toolbar');addButton(actions,'Key',()=>showKeys(site.name));addButton(actions,'分组',()=>showGroups(site.name));card.appendChild(actions);sitesNode.appendChild(card);});}
+async function loadStatus(refresh=false){try{messageNode.textContent='正在加载…';const body=await request('/api/status'+(refresh?'?refresh=1':''));renderSites(body.data||[]);messageNode.textContent='站点数：'+(body.data||[]).length;}catch(error){messageNode.textContent=error.message;}}
+document.getElementById('refresh').addEventListener('click',()=>loadStatus(true));
+document.getElementById('logout').addEventListener('click',async()=>{try{await request('/logout',{method:'POST'});location.reload();}catch(error){messageNode.textContent=error.message;}});
+loadStatus(false);
+</script></body></html>"""
 
-    <!-- Toolbar -->
-    <div class="toolbar">
-      <input type="text" id="searchInput" class="search-input" placeholder="搜索站点名称 / 分组 / 模型..." oninput="filterSites()">
-    </div>
 
-    <!-- Cards Container -->
-    <div class="cards-container" id="cardsContainer">
-      <div style="grid-column: 1/-1; text-align: center; padding: 40px; color: var(--text-muted);">
-        正在加载各中转站点状态...
-      </div>
-    </div>
-  </div>
+def _public(value: Any) -> Any:
+    value = models.sanitize(value)
+    if isinstance(value, dict):
+        return {key: _public(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_public(item) for item in value]
+    if isinstance(value, str):
+        return rcache.redact_text(value)
+    return value
 
-  <!-- Common Modal -->
-  <div class="modal-overlay" id="modalOverlay" onclick="if(event.target===this) closeModal()">
-    <div class="modal-content" id="modalContent">
-      <div class="modal-head">
-        <div class="modal-title" id="modalTitle">详情</div>
-        <button class="modal-close" onclick="closeModal()">&times;</button>
-      </div>
-      <div id="modalBody">加载中...</div>
-    </div>
-  </div>
-
-  <script>
-    let allSites = [];
-
-    async function loadStatus(forceRefresh = false) {
-      try {
-        const btn = document.querySelector('.btn-primary');
-        if (btn) btn.innerText = '刷新中...';
-        const res = await fetch('/api/status' + (forceRefresh ? '?refresh=1' : ''));
-        const json = await res.json();
-        allSites = json.data || [];
-        renderMetrics();
-        renderSites(allSites);
-      } catch (e) {
-        alert('加载状态失败: ' + e);
-      } finally {
-        const btn = document.querySelector('.btn-primary');
-        if (btn) btn.innerText = '⚡ 刷新状态';
-      }
-    }
-
-    function renderMetrics() {
-      document.getElementById('stat-total').innerText = allSites.length;
-      document.getElementById('stat-api').innerText = allSites.filter(s => s.tier === 'api').length;
-      document.getElementById('stat-parked').innerText = allSites.filter(s => s.tier === 'parked').length;
-      let totalBal = 0;
-      allSites.forEach(s => {
-        if (s.balance && !isNaN(parseFloat(s.balance))) {
-          totalBal += parseFloat(s.balance);
-        }
-      });
-      document.getElementById('stat-balance').innerText = totalBal.toFixed(2);
-    }
-
-    function renderSites(sites) {
-      const c = document.getElementById('cardsContainer');
-      if (!sites.length) {
-        c.innerHTML = '<div style="grid-column: 1/-1; text-align: center; padding: 40px; color: var(--text-muted);">未找到匹配的站点</div>';
-        return;
-      }
-      c.innerHTML = sites.map(s => {
-        const isApi = s.tier === 'api';
-        const balStr = s.balance !== '-' ? `${s.balance} <span style="font-size:11px;color:var(--text-muted);">${s.display_type||''}</span>` : '-';
-        return `
-          <div class="site-card">
-            <div>
-              <div class="card-head">
-                <div class="site-name">
-                  ${s.name}
-                </div>
-                <span class="badge badge-${s.tier}">${s.tier}</span>
-              </div>
-              <div class="card-body">
-                <div class="info-row">
-                  <span class="info-label">剩余额度</span>
-                  <span class="balance-val">${balStr}</span>
-                </div>
-                <div class="info-row">
-                  <span class="info-label">用户分组</span>
-                  <span class="info-value">${s.group || '-'}</span>
-                </div>
-                <div class="info-row">
-                  <span class="info-label">Key 总数</span>
-                  <span class="info-value">${s.key_count ?? '-'}</span>
-                </div>
-                ${s.diagnosis ? `<div style="font-size: 11px; color: var(--warning); margin-top: 6px; background: rgba(251,191,36,0.08); padding: 6px; border-radius: 6px;">${s.diagnosis}</div>` : ''}
-              </div>
-            </div>
-            <div class="card-footer">
-              <button class="btn btn-sm" onclick="showKeys('${s.name}')">🔑 密钥列表</button>
-              <button class="btn btn-sm" onclick="showGroups('${s.name}')">🏷️ 模型分组</button>
-              ${isApi ? `<button class="btn btn-sm" style="color:var(--primary);" onclick="showAddKeyModal('${s.name}')">➕ 新建Key</button>` : ''}
-            </div>
-          </div>
-        `;
-      }).join('');
-    }
-
-    function filterSites() {
-      const q = document.getElementById('searchInput').value.toLowerCase().trim();
-      if (!q) {
-        renderSites(allSites);
-        return;
-      }
-      const filtered = allSites.filter(s => 
-        s.name.toLowerCase().includes(q) || 
-        (s.group && s.group.toLowerCase().includes(q)) ||
-        (s.diagnosis && s.diagnosis.toLowerCase().includes(q))
-      );
-      renderSites(filtered);
-    }
-
-    function openModal(title, bodyHtml) {
-      document.getElementById('modalTitle').innerText = title;
-      document.getElementById('modalBody').innerHTML = bodyHtml;
-      document.getElementById('modalOverlay').style.display = 'flex';
-    }
-
-    function closeModal() {
-      document.getElementById('modalOverlay').style.display = 'none';
-    }
-
-    async function showKeys(site) {
-      openModal(`${site} · API 密钥列表`, '<div style="padding:20px;text-align:center;">正在读取密钥列表...</div>');
-      try {
-        const res = await fetch(`/api/keys/${site}`);
-        const json = await res.json();
-        const keys = json.data || [];
-        if (!keys.length) {
-          document.getElementById('modalBody').innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-muted);">暂无有效 Key 或无法读取</div>';
-          return;
-        }
-        const html = `
-          <table class="pure-table">
-            <thead>
-              <tr>
-                <th>名称</th>
-                <th>分组</th>
-                <th>状态</th>
-                <th>剩余额度</th>
-                <th>Key (脱敏)</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${keys.map(k => `
-                <tr>
-                  <td><b>${k.name}</b></td>
-                  <td>${k.group}</td>
-                  <td>${k.enabled ? '启用' : '禁用'}</td>
-                  <td>${k.remain}</td>
-                  <td><span class="key-badge">${k.key_masked}</span></td>
-                </tr>
-              `).join('')}
-            </tbody>
-          </table>
-        `;
-        document.getElementById('modalBody').innerHTML = html;
-      } catch (e) {
-        document.getElementById('modalBody').innerHTML = `<div style="color:var(--danger);">加载失败: ${e}</div>`;
-      }
-    }
-
-    async function showGroups(site) {
-      openModal(`${site} · 可用分组与倍率`, '<div style="padding:20px;text-align:center;">正在查询分组倍率...</div>');
-      try {
-        const res = await fetch(`/api/groups/${site}`);
-        const json = await res.json();
-        const groups = json.data || [];
-        if (!groups.length) {
-          document.getElementById('modalBody').innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-muted);">未发现分组数据</div>';
-          return;
-        }
-        const html = `
-          <table class="pure-table">
-            <thead>
-              <tr>
-                <th>分组名称</th>
-                <th>标定倍率</th>
-                <th>说明</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${groups.map(g => `
-                <tr>
-                  <td><b>${g.name}</b></td>
-                  <td style="color:var(--primary); font-weight:600;">${g.ratio}</td>
-                  <td style="color:var(--text-muted); font-size:12px;">${g.desc || '-'}</td>
-                </tr>
-              `).join('')}
-            </tbody>
-          </table>
-        `;
-        document.getElementById('modalBody').innerHTML = html;
-      } catch (e) {
-        document.getElementById('modalBody').innerHTML = `<div style="color:var(--danger);">加载失败: ${e}</div>`;
-      }
-    }
-
-    function showAddKeyModal(site) {
-      const html = `
-        <form onsubmit="submitAddKey(event, '${site}')">
-          <div class="form-group">
-            <label class="form-label">密钥名称</label>
-            <input type="text" id="kName" class="form-input" required placeholder="如: my-new-key">
-          </div>
-          <div class="form-group">
-            <label class="form-label">选择分组 (Group)</label>
-            <input type="text" id="kGroup" class="form-input" required placeholder="如: default 或 pro">
-          </div>
-          <div class="form-group">
-            <label class="form-label">额度设置</label>
-            <div style="display:flex;gap:10px;align-items:center;">
-              <input type="number" step="0.1" id="kQuota" class="form-input" placeholder="输入额度数 (如 5.0)">
-              <label style="font-size:12px;display:flex;align-items:center;gap:4px;cursor:pointer;">
-                <input type="checkbox" id="kUnlimited" onchange="document.getElementById('kQuota').disabled = this.checked"> 无限额度
-              </label>
-            </div>
-          </div>
-          <div style="margin-top:16px;display:flex;justify-content:flex-end;gap:8px;">
-            <button type="button" class="btn" onclick="closeModal()">取消</button>
-            <button type="submit" class="btn btn-primary">立即创建</button>
-          </div>
-        </form>
-      `;
-      openModal(`在上游 [${site}] 新建密钥`, html);
-    }
-
-    async function submitAddKey(e, site) {
-      e.preventDefault();
-      const name = document.getElementById('kName').value.trim();
-      const group = document.getElementById('kGroup').value.trim();
-      const unlimited = document.getElementById('kUnlimited').checked;
-      const quota = document.getElementById('kQuota').value.trim();
-
-      if (!unlimited && (!quota || parseFloat(quota) <= 0)) {
-        alert('请指定大于 0 的额度，或勾选“无限额度”！');
-        return;
-      }
-
-      const body = { site, name, group, unlimited, quota: unlimited ? null : parseFloat(quota) };
-      try {
-        const res = await fetch('/api/key/add', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify(body)
-        });
-        const json = await res.json();
-        if (json.success) {
-          alert('✓ Key 创建成功！' + (json.key ? 'Key: ' + json.key : ''));
-          closeModal();
-          loadStatus(true);
-        } else {
-          alert('创建失败: ' + (json.message || '未知错误'));
-        }
-      } catch (err) {
-        alert('请求出错: ' + err);
-      }
-    }
-
-    // Initial load
-    loadStatus();
-  </script>
-</body>
-</html>
-"""
 
 class RelayctlWebHandler(BaseHTTPRequestHandler):
     config = None
+    sessions = {}
+    server_version = "relayctl"
+    sys_version = ""
 
-    def _send_json(self, data, code=200):
-        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    def _cfg(self):
+        return self.config if self.config is not None else load_config()
+
+    def _password(self) -> str:
+        return str((self._cfg().get("web") or {}).get("access_password") or "")
+
+    def _security_headers(self):
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+
+    def _send_json(self, data, code=200, extra_headers=None):
+        body = json.dumps(_public(data), ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        # 不放开跨域：默认只监听 127.0.0.1，且不再下发 Access-Control-Allow-Origin: *
-        self.send_header("X-Content-Type-Options", "nosniff")
+        self._security_headers()
+        if code == 401:
+            self.send_header("WWW-Authenticate", 'Bearer realm="relayctl"')
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_html(self, html_str, code=200):
+    def _send_html(self, html_str, code=200, extra_headers=None):
         body = html_str.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self._security_headers()
+        if code == 401:
+            self.send_header("WWW-Authenticate", 'Bearer realm="relayctl"')
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self):
-        url_parts = urllib.parse.urlparse(self.path)
-        path = url_parts.path
+    def _cookie_session(self):
+        raw = self.headers.get("Cookie", "")
+        jar = cookies.SimpleCookie()
+        try:
+            jar.load(raw)
+        except cookies.CookieError:
+            return None, None
+        morsel = jar.get(SESSION_COOKIE)
+        token = morsel.value if morsel else None
+        return token, self.sessions.get(token) if token else None
 
-        if path == "/" or path == "/index.html":
+    def _bearer_valid(self) -> bool:
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Bearer "):
+            return False
+        supplied = header[7:].strip()
+        password = self._password()
+        return bool(password) and hmac.compare_digest(supplied, password)
+
+    def _authenticated(self) -> bool:
+        if not self._password():
+            return True
+        if self._bearer_valid():
+            return True
+        _, session = self._cookie_session()
+        return session is not None
+
+    def _require_auth(self, api=True) -> bool:
+        if self._authenticated():
+            return True
+        if api:
+            self._send_json({"success": False, "message": "未认证"}, 401)
+        else:
+            self._send_html(LOGIN_TEMPLATE, 401)
+        return False
+
+    def _same_origin_or_csrf(self) -> bool:
+        token, session = self._cookie_session()
+        del token
+        csrf = self.headers.get("X-CSRF-Token", "")
+        if session and csrf and hmac.compare_digest(csrf, str(session.get("csrf") or "")):
+            return True
+        fetch_site = self.headers.get("Sec-Fetch-Site", "")
+        if fetch_site and fetch_site not in ("same-origin", "none"):
+            return False
+        origin = self.headers.get("Origin")
+        referer = self.headers.get("Referer")
+        source = origin or referer
+        if source:
+            parsed = urllib.parse.urlparse(source)
+            host = self.headers.get("Host", "")
+            return parsed.scheme in ("http", "https") and parsed.netloc == host
+        # 无浏览器来源头时只允许显式 Bearer 客户端；Cookie 会话必须给同源头或 CSRF。
+        return self._bearer_valid()
+
+    def _content_length(self) -> Optional[int]:
+        raw = self.headers.get("Content-Length")
+        if raw is None:
+            return 0
+        try:
+            length = int(raw)
+        except ValueError:
+            self._send_json({"success": False, "message": "Content-Length 无效"}, 400)
+            return None
+        if length < 0:
+            self._send_json({"success": False, "message": "Content-Length 无效"}, 400)
+            return None
+        if length > MAX_BODY_BYTES:
+            self._send_json({"success": False, "message": "请求体过大"}, 413)
+            return None
+        return length
+
+    def _read_json(self):
+        length = self._content_length()
+        if length is None:
+            return None
+        try:
+            value = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            self._send_json({"success": False, "message": "请求体不是合法 JSON"}, 400)
+            return None
+        if not isinstance(value, dict):
+            self._send_json({"success": False, "message": "请求体必须是 JSON 对象"}, 400)
+            return None
+        return value
+
+    def _read_form(self):
+        length = self._content_length()
+        if length is None:
+            return None
+        try:
+            text = self.rfile.read(length).decode("utf-8")
+        except UnicodeDecodeError:
+            self._send_json({"success": False, "message": "表单编码无效"}, 400)
+            return None
+        return urllib.parse.parse_qs(text, keep_blank_values=True)
+
+    def _sites(self):
+        cfg = self._cfg()
+        return cfg, cfg.get("sites", {})
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        is_api = path.startswith("/api/")
+        if path == "/login":
+            self._send_html(LOGIN_TEMPLATE)
+            return
+        if not self._require_auth(api=is_api):
+            return
+        if path in ("/", "/index.html"):
             self._send_html(HTML_TEMPLATE)
             return
+        if path == "/api/session":
+            _, session = self._cookie_session()
+            self._send_json({"success": True, "csrf": (session or {}).get("csrf", "")})
+            return
 
-        cfg = self.config or load_config()
-        sites = cfg.get("sites", {})
-
-        # GET /api/status
+        cfg, sites = self._sites()
         if path == "/api/status":
-            query = urllib.parse.parse_qs(url_parts.query)
-            force_refresh = "refresh" in query
-            
+            force_refresh = "refresh" in urllib.parse.parse_qs(parsed.query)
             from concurrent.futures import ThreadPoolExecutor
 
             def process_site(item):
-                s_name, s_cfg = item
-                tier = s_cfg.get("tier", "parked")
-                
-                info = {
-                    "name": s_name,
-                    "tier": tier,
-                    "balance": "-",
-                    "used": "-",
-                    "group": "-",
-                    "key_count": "-",
-                    "display_type": "",
-                    "diagnosis": ""
-                }
-
-                if tier == "api":
-                    try:
-                        adapter = get_adapter(s_name, s_cfg, cfg)
-                        mode = rcache.MODE_REFRESH if force_refresh else rcache.MODE_AUTO
-                        bal_data, _ = rcache.fetch(s_name, "balance", adapter.balance, mode)
-                        info["balance"] = str(bal_data.get("balance", "-"))
-                        info["used"] = str(bal_data.get("used", "-"))
-                        info["group"] = bal_data.get("user_group", "-")
-                        info["display_type"] = bal_data.get("display_type", "")
-
-                        # Key count
-                        keys_data, _ = rcache.fetch(s_name, "keys", adapter.list_keys, mode)
-                        info["key_count"] = len(keys_data) if isinstance(keys_data, list) else "-"
-                    except Exception as e:
-                        info["diagnosis"] = f"读取异常: {e}"
-                else:
-                    info["diagnosis"] = s_cfg.get("parked_reason") or "已搁置"
-
+                name, site = item
+                tier = site.get("tier", "parked")
+                info = {"name": name, "tier": tier, "balance": "-", "used": "-",
+                        "group": "-", "key_count": "-", "display_type": "", "diagnosis": ""}
+                if tier != "api":
+                    info["diagnosis"] = site.get("parked_reason") or "已搁置"
+                    return info
+                try:
+                    adapter = get_adapter(name, site, cfg)
+                    mode = rcache.MODE_REFRESH if force_refresh else rcache.MODE_AUTO
+                    balance, _ = rcache.fetch(name, "balance", adapter.balance, mode)
+                    keys, _ = rcache.fetch(name, "keys", adapter.list_keys, mode)
+                    info.update({"balance": str(balance.get("balance", "-")),
+                                 "used": str(balance.get("used", "-")),
+                                 "group": balance.get("user_group", "-"),
+                                 "display_type": balance.get("display_type", ""),
+                                 "key_count": len(keys) if isinstance(keys, list) else "-"})
+                except Exception as exc:
+                    info["diagnosis"] = "读取异常: " + rcache.sanitize_error(exc)
                 return info
 
-            # 并发抓取各站点信息，防止单个慢站点拖垮整体响应
             with ThreadPoolExecutor(max_workers=min(len(sites) or 1, 10)) as executor:
                 data = list(executor.map(process_site, sites.items()))
-
             self._send_json({"success": True, "data": data})
             return
-
-        # GET /api/keys/{site}
         if path.startswith("/api/keys/"):
-            s_name = path[len("/api/keys/"):]
-            if s_name not in sites:
+            name = urllib.parse.unquote(path[len("/api/keys/"):])
+            if name not in sites:
                 self._send_json({"success": False, "message": "站点未登记"}, 404)
                 return
-            s_cfg = sites[s_name]
             try:
-                adapter = get_adapter(s_name, s_cfg, cfg)
-                keys_data = adapter.list_keys()
-                # 永不出明文：剔除 _raw_key 等内部/凭据字段
-                self._send_json({"success": True, "data": models.sanitize(keys_data)})
-            except Exception as e:
-                self._send_json({"success": False, "message": str(e)}, 500)
+                data = get_adapter(name, sites[name], cfg).list_keys()
+                self._send_json({"success": True, "data": data})
+            except Exception:
+                self._send_json({"success": False, "message": "读取 Key 失败"}, 500)
             return
-
-        # GET /api/groups/{site}
         if path.startswith("/api/groups/"):
-            s_name = path[len("/api/groups/"):]
-            if s_name not in sites:
+            name = urllib.parse.unquote(path[len("/api/groups/"):])
+            if name not in sites:
                 self._send_json({"success": False, "message": "站点未登记"}, 404)
                 return
-            s_cfg = sites[s_name]
             try:
-                adapter = get_adapter(s_name, s_cfg, cfg)
-                groups_data = adapter.groups()
-                self._send_json({"success": True, "data": groups_data})
-            except Exception as e:
-                self._send_json({"success": False, "message": str(e)}, 500)
+                self._send_json({"success": True, "data": get_adapter(name, sites[name], cfg).groups()})
+            except Exception:
+                self._send_json({"success": False, "message": "读取分组失败"}, 500)
             return
-
-        self._send_json({"error": "Not Found"}, 404)
+        self._send_json({"success": False, "message": "Not Found"}, 404)
 
     def do_POST(self):
-        url_parts = urllib.parse.urlparse(self.path)
-        path = url_parts.path
-
-        cfg = self.config or load_config()
-        sites = cfg.get("sites", {})
-
-        # POST /api/key/add
-        if path == "/api/key/add":
-            try:
-                content_len = int(self.headers.get("Content-Length", 0))
-                body = json.loads(self.rfile.read(content_len).decode("utf-8"))
-                s_name = body.get("site")
-                k_name = body.get("name")
-                k_group = body.get("group")
-                k_unlimited = body.get("unlimited", False)
-                k_quota = body.get("quota")
-
-                if s_name not in sites:
-                    self._send_json({"success": False, "message": "站点未登记"}, 404)
-                    return
-
-                adapter = get_adapter(s_name, sites[s_name], cfg)
-                res = adapter.create_key(name=k_name, group=k_group, quota=k_quota, unlimited=k_unlimited)
-                rcache.invalidate(s_name, "keys")
-                # 只回传脱敏 Key
-                self._send_json({"success": True, "key_id": res.get("id"),
-                                 "key": res.get("key_masked")})
-            except Exception as e:
-                self._send_json({"success": False, "message": str(e)}, 500)
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/login":
+            if not self._same_origin_or_csrf():
+                self._send_json({"success": False, "message": "跨站请求被拒绝"}, 403)
+                return
+            form = self._read_form()
+            if form is None:
+                return
+            supplied = (form.get("password") or [""])[0]
+            password = self._password()
+            if not password or not hmac.compare_digest(str(supplied), password):
+                self._send_html(LOGIN_TEMPLATE, 401)
+                return
+            token = secrets.token_urlsafe(32)
+            self.sessions[token] = {"csrf": secrets.token_urlsafe(32)}
+            cookie = f"{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/"
+            self._send_html("登录成功", 303, {"Set-Cookie": cookie, "Location": "/"})
             return
 
-        self._send_json({"error": "Not Found"}, 404)
+        if not self._require_auth(api=True):
+            return
+        if not self._same_origin_or_csrf():
+            self._send_json({"success": False, "message": "跨站请求被拒绝"}, 403)
+            return
+        if path == "/logout":
+            token, _ = self._cookie_session()
+            if token:
+                self.sessions.pop(token, None)
+            self._send_json({"success": True}, extra_headers={
+                "Set-Cookie": f"{SESSION_COOKIE}=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/"})
+            return
+        if path == "/api/key/add":
+            body = self._read_json()
+            if body is None:
+                return
+            cfg, sites = self._sites()
+            name = str(body.get("site") or "")
+            if name not in sites:
+                self._send_json({"success": False, "message": "站点未登记"}, 404)
+                return
+            try:
+                result = get_adapter(name, sites[name], cfg).create_key(
+                    name=body.get("name"), group=body.get("group"), quota=body.get("quota"),
+                    unlimited=bool(body.get("unlimited", False)))
+                rcache.invalidate(name, "keys")
+                self._send_json({"success": True, "key_id": result.get("id"),
+                                 "key_masked": result.get("key_masked")})
+            except Exception:
+                self._send_json({"success": False, "message": "创建 Key 失败"}, 500)
+            return
+        self._send_json({"success": False, "message": "Not Found"}, 404)
+
+    def log_message(self, fmt, *args):
+        message = rcache.redact_text(fmt % args)
+        print(f"[web] {message}", file=sys.stderr)
+
 
 # ---------------------------------------------------------------------------
 # Web 内置后台调度器：随 server 启停，绝不由 Web 请求各自创建
 # ---------------------------------------------------------------------------
 def scheduler_enabled(cfg: Optional[dict], override: Optional[bool] = None) -> bool:
-    """是否随 Web 拉起后台刷新调度（config.web.scheduler_enabled，默认 true）。"""
     if override is not None:
         return bool(override)
     web_cfg = (cfg or {}).get("web") or {}
@@ -578,11 +368,6 @@ def scheduler_enabled(cfg: Optional[dict], override: Optional[bool] = None) -> b
 
 def start_background_scheduler(cfg: Optional[dict] = None, enabled: Optional[bool] = None,
                                factory: Any = None) -> Any:
-    """启动后台刷新调度线程；返回 Scheduler，未启用则返回 None。
-
-    线程由 Scheduler 自己以 daemon=True 创建，进程退出不会被它阻塞。
-    """
-    from .config import load_config
     from .scheduler import Scheduler
     cfg = cfg if cfg is not None else load_config()
     if not scheduler_enabled(cfg, enabled):
@@ -596,31 +381,31 @@ def start_background_scheduler(cfg: Optional[dict] = None, enabled: Optional[boo
 
 
 def stop_background_scheduler(scheduler: Any, timeout: float = 5.0):
-    """关闭 server 时 stop + join 后台调度线程。"""
     if scheduler is None:
         return
     try:
         scheduler.stop(timeout)
-    except Exception:  # noqa: BLE001 - 关闭阶段的异常不应影响 Web 退出
+    except Exception:
         pass
 
 
 def run_web(host: str = "127.0.0.1", port: int = 8088,
             config_override: Optional[dict] = None,
             scheduler_enabled: Optional[bool] = None):
-    """启动 relayctl Web 服务（默认只监听回环地址；完整鉴权在阶段 6）。"""
+    """启动 Web；非回环监听必须先配置非空访问口令。"""
     global _WEB_SCHEDULER
     cfg = config_override or load_config()
-    # 后台调度器在 server 之前启动、在 server 关闭之后停止（Web 请求绝不自建调度器）
-    _WEB_SCHEDULER = start_background_scheduler(cfg, enabled=scheduler_enabled)
+    password = str((cfg.get("web") or {}).get("access_password") or "")
+    if not is_loopback(host) and not password:
+        raise ConfigError("Web 监听非回环地址时必须配置 config.web.access_password")
 
     RelayctlWebHandler.config = cfg
-    server_address = (host, port)
-    httpd = HTTPServer(server_address, RelayctlWebHandler)
+    RelayctlWebHandler.sessions = {}
+    httpd = HTTPServer((host, port), RelayctlWebHandler)
+    _WEB_SCHEDULER = start_background_scheduler(cfg, enabled=scheduler_enabled)
     print(f"[*] relayctl Web 控制台已启动: http://{host}:{port}/")
-    print("    支持手机浏览器 (触控适配卡片流) 与桌面浏览器 (宽屏仪表盘)")
-    if host not in ("127.0.0.1", "localhost", "::1"):
-        print(f"[!] 警告: 当前监听 {host}，将暴露到非回环网络且尚未启用访问鉴权")
+    if password:
+        print("    Web 访问口令认证已启用。")
     if _WEB_SCHEDULER is not None:
         print("    内置后台刷新调度已随控制台启动。")
     print("    按 Ctrl+C 停止服务。")
@@ -634,6 +419,7 @@ def run_web(host: str = "127.0.0.1", port: int = 8088,
         finally:
             stop_background_scheduler(_WEB_SCHEDULER)
             _WEB_SCHEDULER = None
+
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8088

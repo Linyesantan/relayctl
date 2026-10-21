@@ -7,6 +7,8 @@ v2 运行时布局: $RELAYCTL_HOME/{config.yaml,sites/<name>.yaml,scripts/,cache
 import sys
 import os
 import argparse
+import contextlib
+import io
 import json
 import getpass
 from typing import Optional
@@ -32,6 +34,16 @@ from relayctl.errors import (  # noqa: E402
 )
 from relayctl.adapters import get_adapter  # noqa: E402
 from relayctl import cache as rcache  # noqa: E402
+from relayctl import doctor as rdoctor  # noqa: E402
+from relayctl import models as rmodels  # noqa: E402
+from relayctl import schema as rschema  # noqa: E402
+
+
+class RelayArgumentParser(argparse.ArgumentParser):
+    """把 argparse 默认退出码 2 统一映射为 relayctl 的 usage/config 退出码 4。"""
+
+    def error(self, message):
+        raise UsageError(message)
 
 
 def cache_note(meta) -> str:
@@ -750,6 +762,31 @@ def cmd_migrate(args, cfg):
 
 
 # ---------------------------------------------------------------------------
+# Schema / doctor / MCP
+# ---------------------------------------------------------------------------
+def cmd_schema(args, cfg):
+    data = rschema.schemas(args.kind)
+    print(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True))
+    return EXIT_OK
+
+
+def cmd_doctor(args, cfg):
+    report, exit_code = rdoctor.run(check_connectivity=args.check_connectivity)
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        for line in rdoctor.report_lines(report):
+            print(line)
+    return exit_code
+
+
+def cmd_mcp(args, cfg):
+    from relayctl.mcp import run_stdio
+    return run_stdio(allow_destructive=args.allow_destructive,
+                     allow_reveal=args.allow_reveal)
+
+
+# ---------------------------------------------------------------------------
 # Web
 # ---------------------------------------------------------------------------
 def cmd_web(args, cfg):
@@ -757,7 +794,7 @@ def cmd_web(args, cfg):
     web_cfg = cfg.get("web") or {}
     host = args.host or web_cfg.get("host") or "127.0.0.1"
     port = args.port or web_cfg.get("port") or 8088
-    run_web(host=host, port=port)
+    run_web(host=host, port=port, config_override=cfg)
     return EXIT_OK
 
 
@@ -789,8 +826,29 @@ def cmd_daemon(args, cfg):
     return EXIT_OK
 
 
+def _add_json_args_recursive(parser, root=True):
+    """让每一级命令都接受 --json/--json-raw，参数可放在命令路径的任一级。"""
+    default = False if root else argparse.SUPPRESS
+    if "--json" not in parser._option_string_actions:
+        parser.add_argument("--json", action="store_true", default=default,
+                            help="输出 relayctl/v2 JSON 信封")
+    elif not root:
+        # 子 parser 不得用默认 False 覆盖顶层已经解析到的 --json。
+        parser._option_string_actions["--json"].default = argparse.SUPPRESS
+    if "--json-raw" not in parser._option_string_actions:
+        parser.add_argument("--json-raw", action="store_true", default=default,
+                            help="只输出 data（兼容旧版 JSON 消费方）")
+    if "--json-envelope" not in parser._option_string_actions:
+        parser.add_argument("--json-envelope", action="store_true", default=default,
+                            help="强制输出 relayctl/v2 信封（覆盖严格旧 JSON 兼容）")
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for child in action.choices.values():
+                _add_json_args_recursive(child, root=False)
+
+
 def build_parser():
-    parser = argparse.ArgumentParser(
+    parser = RelayArgumentParser(
         prog="relayctl",
         description="relayctl: 统一多上游 AI 中转站 Key 与余额管理的轻量级工具 (CLI + Web)")
     parser.add_argument("--version", action="version", version=f"relayctl {__version__}")
@@ -972,6 +1030,23 @@ def build_parser():
     p_mig = subparsers.add_parser("migrate", help="把旧 sites.yaml 迁移为 sites/<name>.yaml")
     p_mig.add_argument("--dry-run", dest="dry_run", action="store_true", help="只预览不写盘")
 
+    # schema
+    p_schema = subparsers.add_parser("schema", help="输出配置与脚本协议 JSON Schema")
+    p_schema.add_argument("--kind", choices=["site", "script", "dist", "all"], default="all",
+                          help="选择 schema 类型（默认 all）")
+
+    # doctor
+    p_doctor = subparsers.add_parser("doctor", help="检查配置、权限、凭据引用与本地缓存")
+    p_doctor.add_argument("--check-connectivity", action="store_true",
+                          help="显式执行站点网络连通性检查（默认绝不联网）")
+
+    # MCP stdio
+    p_mcp = subparsers.add_parser("mcp", help="启动 stdio JSON-RPC MCP 服务")
+    p_mcp.add_argument("--allow-destructive", action="store_true",
+                       help="注册删除类工具")
+    p_mcp.add_argument("--allow-reveal", action="store_true",
+                       help="注册允许明文导出的工具")
+
     # web
     p_web = subparsers.add_parser("web", help="启动双端自适应 Web 管理控制台")
     p_web.add_argument("--host", default=None, help="监听地址 (默认 127.0.0.1)")
@@ -985,6 +1060,7 @@ def build_parser():
     # 顶层 parser 上挂一份子命令 parser 映射（未知子命令时打印对应帮助）
     parser.help_parsers = {"key": p_key, "site": p_site, "import": p_import,
                            "script": p_script, "dist": p_dist}
+    _add_json_args_recursive(parser)
     return parser, p_key, p_site, p_import
 
 
@@ -1022,22 +1098,72 @@ def _add_site_args(parser):
                         help="从 JSON 字符串或 JSON 文件读取站点配置")
 
 
-def main(argv=None):
-    parser, p_key, p_site, p_import = build_parser()
-    args = parser.parse_args(argv)
-    if not args.command:
-        parser.print_help()
-        return EXIT_OK
+def _command_name(args) -> str:
+    parts = [getattr(args, "command", None), getattr(args, "subcommand", None)]
+    return " ".join(str(part) for part in parts if part)
 
-    try:
-        cfg = rconfig.load_config()
-    except ConfigError as e:
-        print(f"[!] 配置加载失败: {e}")
-        return EXIT_USAGE
 
-    for err in cfg.get("site_errors", []):
-        print(f"[!] 站点配置加载失败（已跳过）{err['name']}: {err['error']}", file=sys.stderr)
+def _redact_strings(value):
+    if isinstance(value, dict):
+        return {key: _redact_strings(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_strings(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_strings(item) for item in value]
+    if isinstance(value, str):
+        return rcache.redact_text(value)
+    return value
 
+
+def _data_from_output(text: str, command: str, allow_reveal: bool = False):
+    output = text.strip()
+    if not output:
+        data = None
+    else:
+        try:
+            data = json.loads(output)
+        except ValueError:
+            data = {"text": output}
+    # schema 的 properties 名称本身包含 access_token/key，不能按凭据字段删除。
+    if command != "schema":
+        data = rmodels.sanitize(data)
+    if not allow_reveal:
+        data = _redact_strings(data)
+    return data
+
+
+def _json_envelope(command: str, data, exit_code: int, warnings=None, message: str = "") -> dict:
+    envelope = {
+        "schema": "relayctl/v2",
+        "ok": exit_code == EXIT_OK,
+        "command": command,
+        "data": data,
+        "meta": {"exit_code": exit_code, "version": __version__},
+        "warnings": list(warnings or []),
+        "error": None if exit_code == EXIT_OK else {
+            "code": exit_code,
+            "message": rcache.redact_text(message or f"命令返回退出码 {exit_code}"),
+        },
+    }
+    # 阶段 6 统一以 data 为规范契约；为不破坏 v2 之前已发布且直接读取顶层字段的
+    # 自动化，仅对过去已经支持 --json 的命令提供同名只读兼容别名。新调用方应只
+    # 读取 envelope["data"]；--json-raw 则提供无信封的稳定迁移出口。信封保留字段
+    # 永远不会被别名覆盖，新命令保持严格的七字段信封，不产生重复数据。
+    legacy_json_commands = {
+        "status", "site list", "site show", "script test", "probe-url",
+        "import sites", "import keys", "dist list", "dist tag", "dist assign",
+        "dist rm", "dist export", "daemon",
+    }
+    if command in legacy_json_commands and isinstance(data, dict):
+        for key, value in data.items():
+            # 信封保留字段永不被别名覆盖：data 才是规范契约，
+            # probe-url 等命令的 ok/error 一律读 envelope["data"]。
+            if key not in envelope:
+                envelope[key] = value
+    return envelope
+
+
+def _dispatch(args, cfg, parser, p_key, p_site, p_import):
     handlers = {
         "balance": cmd_balance,
         "status": cmd_status,
@@ -1046,84 +1172,139 @@ def main(argv=None):
         "groups": cmd_groups,
         "keys": cmd_keys,
         "migrate": cmd_migrate,
+        "schema": cmd_schema,
+        "doctor": cmd_doctor,
         "web": cmd_web,
         "daemon": cmd_daemon,
     }
+    if args.command in handlers:
+        return handlers[args.command](args, cfg)
+    if args.command == "key":
+        if args.subcommand == "add":
+            return cmd_key_add(args, cfg)
+        if args.subcommand == "set":
+            return cmd_key_set(args, cfg)
+        if args.subcommand == "rm":
+            return cmd_key_rm(args, cfg)
+        p_key.print_help()
+        return EXIT_USAGE
+    if args.command == "site":
+        if args.subcommand == "list":
+            return cmd_site_list(args, cfg)
+        if args.subcommand == "show":
+            return cmd_site_show(args, cfg)
+        if args.subcommand == "add":
+            return cmd_site_add(args, cfg)
+        if args.subcommand == "set":
+            return cmd_site_set(args, cfg)
+        if args.subcommand == "rm":
+            return cmd_site_rm(args, cfg)
+        if args.subcommand == "auth":
+            return cmd_site_auth(args, cfg)
+        p_site.print_help()
+        return EXIT_USAGE
+    if args.command == "script":
+        if args.subcommand == "new":
+            return cmd_script_new(args, cfg)
+        if args.subcommand == "test":
+            return cmd_script_test(args, cfg)
+        parser.help_parsers["script"].print_help()
+        return EXIT_USAGE
+    if args.command == "import":
+        if args.subcommand == "sites":
+            return cmd_import_sites(args, cfg)
+        if args.subcommand == "keys":
+            return cmd_import_keys(args, cfg)
+        p_import.print_help()
+        return EXIT_USAGE
+    if args.command == "dist":
+        if args.subcommand == "list":
+            return cmd_dist_list(args, cfg)
+        if args.subcommand == "tag":
+            return cmd_dist_tag(args, cfg)
+        if args.subcommand == "assign":
+            return cmd_dist_assign(args, cfg)
+        if args.subcommand == "rm":
+            return cmd_dist_rm(args, cfg)
+        if args.subcommand == "export":
+            return cmd_dist_export(args, cfg)
+        parser.help_parsers["dist"].print_help()
+        return EXIT_USAGE
+    parser.print_help()
+    return EXIT_USAGE
 
+
+def main(argv=None):
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    json_requested = any(flag in raw_argv for flag in ("--json", "--json-raw", "--json-envelope"))
+    parser, p_key, p_site, p_import = build_parser()
     try:
-        if args.command in handlers:
-            return handlers[args.command](args, cfg)
-        if args.command == "key":
-            if args.subcommand == "add":
-                return cmd_key_add(args, cfg)
-            if args.subcommand == "set":
-                return cmd_key_set(args, cfg)
-            if args.subcommand == "rm":
-                return cmd_key_rm(args, cfg)
-            p_key.print_help()
-            return EXIT_USAGE
-        if args.command == "site":
-            if args.subcommand == "list":
-                return cmd_site_list(args, cfg)
-            if args.subcommand == "show":
-                return cmd_site_show(args, cfg)
-            if args.subcommand == "add":
-                return cmd_site_add(args, cfg)
-            if args.subcommand == "set":
-                return cmd_site_set(args, cfg)
-            if args.subcommand == "rm":
-                return cmd_site_rm(args, cfg)
-            if args.subcommand == "auth":
-                return cmd_site_auth(args, cfg)
-            p_site.print_help()
-            return EXIT_USAGE
-        if args.command == "script":
-            if args.subcommand == "new":
-                return cmd_script_new(args, cfg)
-            if args.subcommand == "test":
-                return cmd_script_test(args, cfg)
-            parser.help_parsers["script"].print_help()
-            return EXIT_USAGE
-        if args.command == "import":
-            if args.subcommand == "sites":
-                return cmd_import_sites(args, cfg)
-            if args.subcommand == "keys":
-                return cmd_import_keys(args, cfg)
-            p_import.print_help()
-            return EXIT_USAGE
-        if args.command == "dist":
-            if args.subcommand == "list":
-                return cmd_dist_list(args, cfg)
-            if args.subcommand == "tag":
-                return cmd_dist_tag(args, cfg)
-            if args.subcommand == "assign":
-                return cmd_dist_assign(args, cfg)
-            if args.subcommand == "rm":
-                return cmd_dist_rm(args, cfg)
-            if args.subcommand == "export":
-                return cmd_dist_export(args, cfg)
-            parser.help_parsers["dist"].print_help()
-            return EXIT_USAGE
+        args = parser.parse_args(raw_argv)
+    except UsageError as exc:
+        if json_requested:
+            command = next((part for part in raw_argv if not part.startswith("-")), "")
+            print(json.dumps(_json_envelope(command, None, EXIT_USAGE, message=str(exc)),
+                             ensure_ascii=False, indent=2, sort_keys=True))
+        else:
+            print(parser.format_usage().rstrip())
+            print(f"[!] 参数问题: {exc}")
+        return EXIT_USAGE
+
+    args.json_raw = bool(getattr(args, "json_raw", False))
+    args.json_envelope = bool(getattr(args, "json_envelope", False))
+    args.json = bool(getattr(args, "json", False) or args.json_raw or args.json_envelope)
+    if not args.command:
         parser.print_help()
-        return EXIT_USAGE
-    except AuthError as e:
-        print(f"[!] 鉴权失败: {e}")
-        return EXIT_AUTH
-    except UsageError as e:
-        print(f"[!] 参数问题: {e}")
-        return EXIT_USAGE
-    except NotSupported as e:
-        print(f"[!] {e}")
-        return EXIT_NOTSUPPORTED
-    except ConfigError as e:
-        print(f"[!] 配置错误: {e}")
-        return EXIT_USAGE
+        return EXIT_OK
+
+    # MCP 的 stdout 专用于 JSON-RPC 帧，绝不能经过普通 CLI 信封或输出捕获。
+    if args.command == "mcp":
+        return cmd_mcp(args, None)
+
+    command = _command_name(args)
+    warnings = []
+    error_message = ""
+    captured = io.StringIO()
+    try:
+        if args.command in ("schema", "doctor"):
+            cfg = None
+        else:
+            cfg = rconfig.load_config()
+            warnings = [f"站点 {item['name']} 配置加载失败: {item['error']}"
+                        for item in cfg.get("site_errors", [])]
+            if not args.json:
+                for warning in warnings:
+                    print(f"[!] {warning}", file=sys.stderr)
+        with contextlib.redirect_stdout(captured):
+            exit_code = _dispatch(args, cfg, parser, p_key, p_site, p_import)
+    except AuthError as exc:
+        exit_code, error_message = EXIT_AUTH, f"鉴权失败: {exc}"
+    except UsageError as exc:
+        exit_code, error_message = EXIT_USAGE, f"参数问题: {exc}"
+    except NotSupported as exc:
+        exit_code, error_message = EXIT_NOTSUPPORTED, str(exc)
+    except ConfigError as exc:
+        exit_code, error_message = EXIT_USAGE, f"配置错误: {exc}"
     except KeyboardInterrupt:
-        print("\n[!] 已中断")
-        return EXIT_FAIL
-    except Exception as e:
-        print(f"[!] 操作失败: {e}")
-        return EXIT_FAIL
+        exit_code, error_message = EXIT_FAIL, "已中断"
+    except Exception as exc:  # CLI 边界统一收敛，客户端不接收堆栈
+        exit_code, error_message = EXIT_FAIL, f"操作失败: {exc}"
+
+    if args.json:
+        allow_reveal = command == "dist export" and bool(getattr(args, "reveal", False))
+        data = _data_from_output(captured.getvalue(), command, allow_reveal=allow_reveal)
+        if args.json_raw:
+            if error_message and data is None:
+                data = {"error": rcache.redact_text(error_message), "code": exit_code}
+            print(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True))
+        else:
+            print(json.dumps(_json_envelope(command, data, exit_code, warnings, error_message),
+                             ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        sys.stdout.write(captured.getvalue())
+        if error_message:
+            print(f"[!] {rcache.redact_text(error_message)}")
+    return exit_code
 
 
 if __name__ == "__main__":

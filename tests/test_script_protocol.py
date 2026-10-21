@@ -576,9 +576,14 @@ class ScriptCliTests(ScriptHomeMixin, unittest.TestCase):
         rc, out, _ = self.run_cli("script", "test", "demo", "--json")
         self.assertEqual(rc, 0)
         payload = json.loads(out)
-        self.assertEqual(sorted(payload), sorted(
-            ["site", "script", "timeout", "ok", "summary", "actions"]))
+        self.assertIn("schema", payload)
         self.assertTrue(payload["ok"])
+        # 规范契约在 data；顶层同名别名仅为兼容旧调用方
+        self.assertEqual(sorted(payload["data"]), sorted(
+            ["site", "script", "timeout", "ok", "summary", "actions"]))
+        for key in ("site", "script", "timeout", "ok", "summary", "actions"):
+            self.assertIn(key, payload, key)
+        self.assertTrue(payload["data"]["ok"])
         self.assertEqual(payload["summary"]["total"], len(rscript.ACTIONS))
         self.assertEqual(payload["summary"]["unsupported"], len(rscript.ACTIONS))
         self.assertEqual([a["action"] for a in payload["actions"]],
