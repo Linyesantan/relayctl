@@ -18,6 +18,8 @@ if parent_dir not in sys.path:
 
 from relayctl import __version__  # noqa: E402
 from relayctl import config as rconfig  # noqa: E402
+from relayctl import distribution as rdist  # noqa: E402
+from relayctl import exporters as rexporters  # noqa: E402
 from relayctl import importers  # noqa: E402
 from relayctl import migrate as rmigrate  # noqa: E402
 from relayctl import paths  # noqa: E402
@@ -26,7 +28,7 @@ from relayctl import script_adapter as rscript  # noqa: E402
 from relayctl.core import print_table  # noqa: E402
 from relayctl.errors import (  # noqa: E402
     EXIT_OK, EXIT_FAIL, EXIT_AUTH, EXIT_NOTSUPPORTED, EXIT_USAGE,
-    AuthError, ConfigError, NotSupported,
+    AuthError, ConfigError, NotSupported, UsageError,
 )
 from relayctl.adapters import get_adapter  # noqa: E402
 from relayctl import cache as rcache  # noqa: E402
@@ -664,6 +666,76 @@ def cmd_import_keys(args, cfg):
 
 
 # ---------------------------------------------------------------------------
+# 分发库 (dist)
+# ---------------------------------------------------------------------------
+def cmd_dist_list(args, cfg):
+    items = rdist.list_keys(tag=args.tag or "", site=args.site or "")
+    if args.json:
+        print(json.dumps({"count": len(items), "items": items},
+                         ensure_ascii=False, indent=2))
+        return EXIT_OK
+    for line in rdist.list_lines(items):
+        print(line)
+    return EXIT_OK
+
+
+def cmd_dist_tag(args, cfg):
+    result = rdist.tag_key(args.id, add=args.add or "", remove=args.rm or "",
+                           dry_run=args.dry_run)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return EXIT_OK
+    if not result["changed"]:
+        print(f"[-] {args.id} 标签无变化: {','.join(result['after'].get('tags') or []) or '-'}")
+        return EXIT_OK
+    print(f"[✓] {result['after']['id']}  {result['after']['key_masked']}  "
+          f"标签={','.join(result['after'].get('tags') or []) or '-'}"
+          f"{'（试运行未写盘）' if args.dry_run else ''}")
+    return EXIT_OK
+
+
+def cmd_dist_assign(args, cfg):
+    result = rdist.assign_key(args.id, args.to, note=args.note or "", dry_run=args.dry_run)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return EXIT_OK
+    if not result["changed"]:
+        print(f"[-] {args.id} 归属无变化: {result['after'].get('assigned_to') or '-'}")
+        return EXIT_OK
+    print(f"[✓] {result['after']['id']}  {result['after']['key_masked']}  "
+          f"归属={result['after'].get('assigned_to') or '-'}"
+          f"{'（试运行未写盘）' if args.dry_run else ''}")
+    return EXIT_OK
+
+
+def cmd_dist_rm(args, cfg):
+    result = rdist.remove_key(args.id, yes=args.yes, dry_run=args.dry_run)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return EXIT_OK
+    removed = result["removed"]
+    print(f"[✓] 已删除 {removed['id']}  {removed['key_masked']}（仅本地登记，不动上游）"
+          f"{'（试运行未写盘）' if result['dry_run'] else ''}")
+    return EXIT_OK
+
+
+def cmd_dist_export(args, cfg):
+    # newapi 目标里 --site 是「推送到哪个已登记站点」；其它目标里是来源站点过滤
+    site_filter = "" if args.target == "newapi" else (args.site or "")
+    keys = rdist.select_keys(tag=args.tag or "", site=site_filter)
+    result = rdist.export(
+        keys, args.target, app=args.app, out=args.out, dry_run=args.dry_run,
+        yes=args.yes, reveal=args.reveal, site=args.site, cfg=cfg,
+        channel_type=args.channel_type)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        for line in rdist.export_lines(result):
+            print(line)
+    return EXIT_FAIL if result.get("failed") else EXIT_OK
+
+
+# ---------------------------------------------------------------------------
 # 迁移
 # ---------------------------------------------------------------------------
 def cmd_migrate(args, cfg):
@@ -848,6 +920,54 @@ def build_parser():
     p_ikeys.add_argument("--format", dest="format", default="auto",
                          choices=list(importers.KEY_FORMATS), help="导入格式（默认 auto）")
 
+    # dist
+    p_dist = subparsers.add_parser("dist", help="分发库管理 (list / tag / assign / rm / export)")
+    dist_subs = p_dist.add_subparsers(dest="subcommand")
+
+    p_dlist = dist_subs.add_parser("list", help="列出分发 Key（默认只显示 id 与脱敏 Key）")
+    p_dlist.add_argument("--tag", help="按标签过滤")
+    p_dlist.add_argument("--site", help="按来源站点过滤")
+    p_dlist.add_argument("--json", action="store_true", help="输出 JSON 格式")
+
+    p_dtag = dist_subs.add_parser("tag", help="增删分发 Key 的标签")
+    p_dtag.add_argument("id", help="Key 指纹 id（可写唯一前缀）")
+    p_dtag.add_argument("--add", help="新增标签（逗号分隔）")
+    p_dtag.add_argument("--rm", help="移除标签（逗号分隔）")
+    p_dtag.add_argument("--dry-run", dest="dry_run", action="store_true", help="只预览不写盘")
+    p_dtag.add_argument("--json", action="store_true", help="输出 JSON 格式")
+
+    p_dassign = dist_subs.add_parser("assign", help="记录 Key 归属（谁 / 哪个客户端）")
+    p_dassign.add_argument("id", help="Key 指纹 id（可写唯一前缀）")
+    p_dassign.add_argument("--to", required=True, help="归属对象（人 / 客户端）")
+    p_dassign.add_argument("--note", help="备注")
+    p_dassign.add_argument("--dry-run", dest="dry_run", action="store_true", help="只预览不写盘")
+    p_dassign.add_argument("--json", action="store_true", help="输出 JSON 格式")
+
+    p_drm = dist_subs.add_parser("rm", help="从分发库删除一条登记（不动上游）")
+    p_drm.add_argument("id", help="Key 指纹 id（可写唯一前缀）")
+    p_drm.add_argument("--yes", action="store_true", help="确认删除（破坏性操作）")
+    p_drm.add_argument("--dry-run", dest="dry_run", action="store_true", help="只预览不写盘")
+    p_drm.add_argument("--json", action="store_true", help="输出 JSON 格式")
+
+    p_dexp = dist_subs.add_parser("export", help="导出分发 Key")
+    p_dexp.add_argument("--target", required=True, choices=list(rdist.EXPORT_TARGETS),
+                        help="导出目标: ccswitch / newapi / env / json / csv")
+    p_dexp.add_argument("--tag", help="只导出带该标签的 Key")
+    p_dexp.add_argument("--app", default="all", choices=list(rexporters.CCSWITCH_APP_CHOICES),
+                        help="ccswitch 目标的应用（默认 all）")
+    p_dexp.add_argument("--site", help="newapi: 推送到哪个已登记站点；其它: 按来源站点过滤")
+    p_dexp.add_argument("--channel-type", dest="channel_type",
+                        default=str(rexporters.DEFAULT_CHANNEL_TYPE),
+                        help="newapi 渠道 type（1 openai / 14 anthropic / 24 gemini / 57 codex）")
+    p_dexp.add_argument("--out", help="导出文件路径（0600；不写 stdout）")
+    p_dexp.add_argument("--dry-run", dest="dry_run", action="store_true",
+                        help="只预览，绝不写盘 / 绝不写上游")
+    p_dexp.add_argument("--yes", action="store_true",
+                        help="newapi 实际写入的确认（默认试运行）")
+    p_dexp.add_argument("--reveal", action="store_true",
+                        help="显式要求把明文 Key 打到 stdout（默认只显示脱敏）")
+    p_dexp.add_argument("--json", action="store_true", help="输出 JSON 格式")
+
     # migrate
     p_mig = subparsers.add_parser("migrate", help="把旧 sites.yaml 迁移为 sites/<name>.yaml")
     p_mig.add_argument("--dry-run", dest="dry_run", action="store_true", help="只预览不写盘")
@@ -864,7 +984,7 @@ def build_parser():
 
     # 顶层 parser 上挂一份子命令 parser 映射（未知子命令时打印对应帮助）
     parser.help_parsers = {"key": p_key, "site": p_site, "import": p_import,
-                           "script": p_script}
+                           "script": p_script, "dist": p_dist}
     return parser, p_key, p_site, p_import
 
 
@@ -971,11 +1091,27 @@ def main(argv=None):
                 return cmd_import_keys(args, cfg)
             p_import.print_help()
             return EXIT_USAGE
+        if args.command == "dist":
+            if args.subcommand == "list":
+                return cmd_dist_list(args, cfg)
+            if args.subcommand == "tag":
+                return cmd_dist_tag(args, cfg)
+            if args.subcommand == "assign":
+                return cmd_dist_assign(args, cfg)
+            if args.subcommand == "rm":
+                return cmd_dist_rm(args, cfg)
+            if args.subcommand == "export":
+                return cmd_dist_export(args, cfg)
+            parser.help_parsers["dist"].print_help()
+            return EXIT_USAGE
         parser.print_help()
         return EXIT_USAGE
     except AuthError as e:
         print(f"[!] 鉴权失败: {e}")
         return EXIT_AUTH
+    except UsageError as e:
+        print(f"[!] 参数问题: {e}")
+        return EXIT_USAGE
     except NotSupported as e:
         print(f"[!] {e}")
         return EXIT_NOTSUPPORTED
