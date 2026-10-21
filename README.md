@@ -815,3 +815,10 @@ RELAYCTL_HOME=/tmp/relayctl-smoke python bin/relayctl doctor
 
 运行时依赖只有 `requests` 与 `PyYAML`（见 `requirements.txt`）；
 Web 面板、MCP 服务与脚本基类均为零额外依赖（只用标准库）。
+
+---
+
+## 致谢与社区
+
+感谢 [LINUX DO](https://linux.do/) 社区提供开源推广与技术交流平台。
+
