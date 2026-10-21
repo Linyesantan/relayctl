@@ -324,9 +324,9 @@ class ImportKeysCliTests(Base):
         rc, out, _ = self.run_cli("import", "keys", path, "--json")
         self.assertEqual(rc, EXIT_OK, out)
         payload = json.loads(out)
-        self.assertEqual(len(payload["added"]), 1)
+        self.assertEqual(len(payload["data"]["added"]), 1)
         self.assertNotIn(K2, json.dumps(payload, ensure_ascii=False))
-        self.assertEqual(payload["added"][0]["id"], importers.fingerprint(K2))
+        self.assertEqual(payload["data"]["added"][0]["id"], importers.fingerprint(K2))
 
     def test_dry_run_cli_writes_nothing(self):
         path = os.path.join(self.tmp, "k.txt")
@@ -343,7 +343,7 @@ class ImportKeysCliTests(Base):
             f.write("no-key-here\n")
         rc, out, _ = self.run_cli("import", "keys", path, "--json")
         self.assertEqual(rc, EXIT_FAIL)
-        self.assertEqual(len(json.loads(out)["failed"]), 1)
+        self.assertEqual(len(json.loads(out)["data"]["failed"]), 1)
 
     def test_second_import_is_deduped(self):
         path = os.path.join(self.tmp, "k.txt")
@@ -353,7 +353,7 @@ class ImportKeysCliTests(Base):
         rc, out, _ = self.run_cli("import", "keys", path, "--json")
         self.assertEqual(rc, EXIT_OK, out)
         payload = json.loads(out)
-        self.assertEqual(len(payload["skipped"]), 2)
+        self.assertEqual(len(payload["data"]["skipped"]), 2)
         self.assertEqual(len(self.dist()["keys"]), 2)
 
 

@@ -547,6 +547,9 @@ def save_site(name: str, cfg: Dict[str, Any]) -> str:
     normalized, _ = normalize_site(cfg, name=site_name, strict=True)
     normalized["name"] = site_name
     payload = strip_internal(_strip_resolved_token(normalized))
+    # tier 是 v1 遗留字段，v2 以 status(active/parked) 为准；落盘不再写入，
+    # 内存态 normalize_site 仍推导 tier 供旧读取方兼容，但持久化文件保持干净。
+    payload.pop("tier", None)
     ordered = {key: payload[key] for key in SITE_FIELDS if key in payload}
     for key, value in payload.items():
         if key not in ordered:

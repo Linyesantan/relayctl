@@ -50,9 +50,12 @@ class CliJsonTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertIsNone(payload["error"])
 
-    def test_legacy_dict_alias_and_raw_mode(self):
+    def test_envelope_is_clean_and_raw_mode(self):
         code, payload, _ = self.run_cli("site", "list", "--json")
         self.assertEqual(code, 0)
+        # 信封只含固定七字段，data 不再在顶层重复
+        self.assertEqual(set(payload),
+                         {"schema", "ok", "command", "data", "meta", "warnings", "error"})
         self.assertEqual(payload["data"], {})
         code, raw, _ = self.run_cli("site", "list", "--json-raw")
         self.assertEqual(code, 0)
@@ -90,7 +93,7 @@ class CliJsonTests(unittest.TestCase):
             *importers.parse_keys(key, fmt="txt"), cfg=config.load_config())
         code, payload, _ = self.run_cli("dist", "list", "--json")
         self.assertEqual(code, 0)
-        items = payload["data"] if isinstance(payload.get("data"), list) else payload["items"]
+        items = payload["data"]["items"]
         self.assertTrue(items)
         self.assertEqual(items[0]["key_masked"], importers.mask_key(key))
         self.assertNotIn(key, json.dumps(payload, ensure_ascii=False))

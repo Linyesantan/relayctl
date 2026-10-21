@@ -109,6 +109,7 @@ def cmd_status(args, cfg):
                 result[name] = {"tier": "parked", "reason": s_cfg.get("parked_reason")}
                 continue
             try:
+                print(f"[刷新] {name} ...", file=sys.stderr, flush=True)
                 adapter = get_adapter(name, s_cfg, cfg)
                 b, b_meta = rcache.fetch(name, "balance", adapter.balance, c_mode)
                 key_count = None
@@ -150,6 +151,7 @@ def cmd_status(args, cfg):
                          s_cfg.get("parked_reason") or "缺少凭据"])
             continue
         try:
+            print(f"[刷新] {name} ...", file=sys.stderr, flush=True)
             adapter = get_adapter(name, s_cfg, cfg)
             b, b_meta = rcache.fetch(name, "balance", adapter.balance, c_mode)
             notes.append(f"  - {name}: {cache_note(b_meta)}")
@@ -1157,21 +1159,8 @@ def _json_envelope(command: str, data, exit_code: int, warnings=None, message: s
             "message": rcache.redact_text(message or f"命令返回退出码 {exit_code}"),
         },
     }
-    # 阶段 6 统一以 data 为规范契约；为不破坏 v2 之前已发布且直接读取顶层字段的
-    # 自动化，仅对过去已经支持 --json 的命令提供同名只读兼容别名。新调用方应只
-    # 读取 envelope["data"]；--json-raw 则提供无信封的稳定迁移出口。信封保留字段
-    # 永远不会被别名覆盖，新命令保持严格的七字段信封，不产生重复数据。
-    legacy_json_commands = {
-        "status", "site list", "site show", "script test", "probe-url",
-        "import sites", "import keys", "dist list", "dist tag", "dist assign",
-        "dist rm", "dist export", "daemon",
-    }
-    if command in legacy_json_commands and isinstance(data, dict):
-        for key, value in data.items():
-            # 信封保留字段永不被别名覆盖：data 才是规范契约，
-            # probe-url 等命令的 ok/error 一律读 envelope["data"]。
-            if key not in envelope:
-                envelope[key] = value
+    # data 是唯一规范契约；信封只保留上述固定字段，顶层不再重复 data 内容，
+    # 避免结构冗余。旧自动化可改用 --json-raw 或读取 envelope["data"]。
     return envelope
 
 

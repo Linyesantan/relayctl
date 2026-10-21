@@ -578,17 +578,15 @@ class ScriptCliTests(ScriptHomeMixin, unittest.TestCase):
         payload = json.loads(out)
         self.assertIn("schema", payload)
         self.assertTrue(payload["ok"])
-        # 规范契约在 data；顶层同名别名仅为兼容旧调用方
+        # 规范契约只在 data；信封顶层不再重复 data 内容
         self.assertEqual(sorted(payload["data"]), sorted(
             ["site", "script", "timeout", "ok", "summary", "actions"]))
-        for key in ("site", "script", "timeout", "ok", "summary", "actions"):
-            self.assertIn(key, payload, key)
         self.assertTrue(payload["data"]["ok"])
-        self.assertEqual(payload["summary"]["total"], len(rscript.ACTIONS))
-        self.assertEqual(payload["summary"]["unsupported"], len(rscript.ACTIONS))
-        self.assertEqual([a["action"] for a in payload["actions"]],
+        self.assertEqual(payload["data"]["summary"]["total"], len(rscript.ACTIONS))
+        self.assertEqual(payload["data"]["summary"]["unsupported"], len(rscript.ACTIONS))
+        self.assertEqual([a["action"] for a in payload["data"]["actions"]],
                          list(rscript.ACTIONS))
-        for entry in payload["actions"]:
+        for entry in payload["data"]["actions"]:
             self.assertEqual(entry["status"], "unsupported")
             self.assertEqual(entry["exit_code"], 3)
             self.assertIn("elapsed_ms", entry)
@@ -626,7 +624,7 @@ class ScriptCliTests(ScriptHomeMixin, unittest.TestCase):
         rc, out, _ = self.run_cli("script", "test", "demo", "--json")
         self.assertEqual(rc, EXIT_FAIL)
         self.assertFalse(json.loads(out)["ok"])
-        self.assertEqual(json.loads(out)["summary"]["failed"], len(rscript.ACTIONS))
+        self.assertEqual(json.loads(out)["data"]["summary"]["failed"], len(rscript.ACTIONS))
 
     def test_script_new_refuses_without_force(self):
         self.add_site("demo")

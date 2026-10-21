@@ -399,7 +399,7 @@ class CliTests(Base):
         self.assertNotIn(K1, out)
         rc, out, _ = self.run_cli("dist", "list", "--json")
         self.assertEqual(rc, EXIT_OK)
-        self.assertEqual(json.loads(out)["count"], 1)
+        self.assertEqual(json.loads(out)["data"]["count"], 1)
 
     def test_dist_tag_and_assign_persist(self):
         ids = self.seed(K1)

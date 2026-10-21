@@ -4,7 +4,7 @@
 - --dry-run 只计算不写盘；
 - 实际迁移逐站原子写，单站失败不影响其它站；
 - 迁移成功后不删除旧 sites.yaml，可重复执行（已存在的站记 skipped，保持幂等）；
-- 旧字段 adapter/base/proxy/auth/tier/parked_reason 一律保留，
+- 旧字段 adapter/base/proxy/auth/parked_reason 保留，tier 已由 v2 的 status 取代不再写入；
   缺失的 name/console_url/panel/docs/tags/refresh_interval/status 由迁移补全。
 """
 

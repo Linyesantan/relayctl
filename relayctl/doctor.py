@@ -184,14 +184,39 @@ def _cache_checks(checks: List[Dict[str, Any]]):
             _add(checks, f"cache.{filename}", False, _LEVEL_WARN, f"缓存无法解析: {exc}")
 
 
+def _docs_checks(checks: List[Dict[str, Any]], sites: Dict[str, Dict[str, Any]]):
+    """维护档案完整性检查：docs 的必填字段缺失只告警，不影响退出码。"""
+    required = ("login_method", "token_howto", "notes")
+    for name, site in sites.items():
+        docs = site.get("docs") or {}
+        missing = [f for f in required if not str(docs.get(f) or "").strip()]
+        if missing:
+            _add(checks, f"site.{name}.docs", False, _LEVEL_WARN,
+                 f"维护信息缺失: {', '.join(missing)}（建议补全 docs 以便人和 AI 维护）",
+                 EXIT_OK)
+        else:
+            _add(checks, f"site.{name}.docs", True, _LEVEL_INFO, "维护信息完整")
+
+
 def _web_check(checks: List[Dict[str, Any]], global_cfg: Dict[str, Any]):
     web = global_cfg.get("web") if isinstance(global_cfg, dict) else {}
     web = web if isinstance(web, dict) else {}
     host = web.get("host") or "127.0.0.1"
     password = str(web.get("access_password") or "")
-    ok = is_loopback(host) or bool(password)
-    _add(checks, "web.access", ok, _LEVEL_ERROR,
-         f"host={host}；" + ("已配置访问口令" if password else "未配置访问口令"), EXIT_USAGE)
+    if not is_loopback(host):
+        if password:
+            _add(checks, "web.access", True, _LEVEL_INFO, f"host={host}；已配置访问口令")
+        else:
+            _add(checks, "web.access", False, _LEVEL_ERROR,
+                 f"host={host} 非回环且未配置访问口令，存在暴露风险", EXIT_USAGE)
+    else:
+        if password:
+            _add(checks, "web.access", True, _LEVEL_INFO, "监听回环且已配置访问口令")
+        else:
+            # 仅本机可访问，风险可控；给出提示而非静默 OK / 报错。
+            _add(checks, "web.access", True, _LEVEL_INFO,
+                 "监听回环 127.0.0.1 且未配置访问口令（仅本机可访问；"
+                 "如需远程访问请设置 web.access_password）")
 
 
 def _connectivity_checks(checks: List[Dict[str, Any]], global_cfg: Dict[str, Any],
@@ -229,6 +254,7 @@ def run(check_connectivity: bool = False) -> Tuple[Dict[str, Any], int]:
     global_cfg = _load_raw_global(checks)
     sites, _ = _site_checks(checks)
     _credential_and_script_checks(checks, sites)
+    _docs_checks(checks, sites)
     _cache_checks(checks)
     _web_check(checks, global_cfg)
     if check_connectivity:

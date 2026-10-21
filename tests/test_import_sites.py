@@ -488,8 +488,8 @@ class ImportSitesCliTests(Base):
             rc, out, _ = self.run_cli("import", "sites", "-", "--dry-run", "--json")
         self.assertEqual(rc, EXIT_OK, out)
         payload = json.loads(out)
-        self.assertEqual(payload["dry_run"], True)
-        self.assertEqual(payload["added"][0]["name"], "cli-site")
+        self.assertEqual(payload["data"]["dry_run"], True)
+        self.assertEqual(payload["data"]["added"][0]["name"], "cli-site")
         self.assertNotIn(TOKEN, out)
         self.assertFalse(os.path.exists(paths.site_path("cli-site")))
 
@@ -519,7 +519,7 @@ class ImportSitesCliTests(Base):
         rc, out, _ = self.run_cli("import", "sites", path, "--json")
         self.assertEqual(rc, EXIT_FAIL)
         payload = json.loads(out)
-        self.assertEqual(len(payload["failed"]), 1)
+        self.assertEqual(len(payload["data"]["failed"]), 1)
 
     def test_json_output_never_contains_token(self):
         path = os.path.join(self.tmp, "s.json")
@@ -531,7 +531,7 @@ class ImportSitesCliTests(Base):
             rc, out, _ = self.run_cli("import", "sites", path, "--json")
         self.assertEqual(rc, EXIT_OK, out)
         payload = json.loads(out)
-        self.assertIn("added", payload)
+        self.assertIn("added", payload["data"])
         self.assertNotIn(TOKEN, json.dumps(payload, ensure_ascii=False))
         self.assertNotIn("token", json.dumps(payload, ensure_ascii=False).lower())
 
@@ -547,9 +547,9 @@ class ImportSitesCliTests(Base):
             rc, out, _ = self.run_cli("probe-url", "https://p.example.com/v1", "--json")
         self.assertEqual(rc, EXIT_OK, out)
         payload = json.loads(out)
-        self.assertEqual(payload["panel"], "newapi")
-        self.assertEqual(payload["version"], "v0.9.5")
-        self.assertEqual(payload["base"], "https://p.example.com")
+        self.assertEqual(payload["data"]["panel"], "newapi")
+        self.assertEqual(payload["data"]["version"], "v0.9.5")
+        self.assertEqual(payload["data"]["base"], "https://p.example.com")
 
 
 if __name__ == "__main__":

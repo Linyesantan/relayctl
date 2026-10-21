@@ -152,7 +152,7 @@ class CacheFreshnessCliTests(CliTestBase):
         self.patch_adapters()
         rc, out, _ = self.run_cli("status", "--json")
         payload = json.loads(out)
-        entry = payload["cli-site"]
+        entry = payload["data"]["cli-site"]
         for key in ("fetched_at", "from_cache", "stale", "last_error"):
             self.assertIn(key, entry)
 
@@ -180,8 +180,8 @@ class DaemonCommandTests(CliTestBase):
         rc, out, _ = self.run_cli("daemon", "--once", "--json")
         self.assertEqual(rc, EXIT_OK, out)
         payload = json.loads(out)
-        self.assertIn("summary", payload)
-        entry = payload["sites"]["daemon-site"]
+        self.assertIn("summary", payload["data"])
+        entry = payload["data"]["sites"]["daemon-site"]
         for key in ("sections", "success", "errors", "next_refresh_at", "next_refresh_at_local"):
             self.assertIn(key, entry)
         self.assertEqual(sorted(entry["sections"]), sorted(rsched.SECTIONS))
@@ -189,9 +189,9 @@ class DaemonCommandTests(CliTestBase):
         self.assertFalse(entry["errors"])
         self.assertIsNotNone(entry["next_refresh_at"])
 
-        self.assertFalse(payload["sites"]["daemon-parked"]["refreshed"])
-        self.assertFalse(payload["sites"]["daemon-manual"]["refreshed"])
-        self.assertEqual(payload["summary"]["refreshed"], 1)
+        self.assertFalse(payload["data"]["sites"]["daemon-parked"]["refreshed"])
+        self.assertFalse(payload["data"]["sites"]["daemon-manual"]["refreshed"])
+        self.assertEqual(payload["data"]["summary"]["refreshed"], 1)
 
     def test_daemon_once_human_output(self):
         self.add_site("daemon-site")
@@ -212,7 +212,7 @@ class DaemonCommandTests(CliTestBase):
         rc, out, _ = self.run_cli("daemon", "--once", "--json")
         self.assertEqual(rc, EXIT_FAIL)
         payload = json.loads(out)
-        entry = payload["sites"]["broken-site"]
+        entry = payload["data"]["sites"]["broken-site"]
         self.assertFalse(entry["success"])
         self.assertTrue(entry["errors"])
         self.assertFalse(entry["sections"]["balance"]["ok"])

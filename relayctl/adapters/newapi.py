@@ -187,7 +187,8 @@ class NewAPIAdapter(BaseAdapter):
         used_quota = user_data.get("used_quota", 0)
         group = user_data.get("group", "default")
         
-        # 统一不换算：金额 = quota / quota_per_unit，只显示纯数字
+        # 归一化：raw_quota 除以 quota_per_unit 得到面板展示单位下的余额
+        # （如美元计价的金额），保留 4 位小数；raw_quota/raw_used 原值另行返回。
         unit = self.quota_per_unit or 500000
         val = quota / unit
         used_val = used_quota / unit
