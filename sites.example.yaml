@@ -1,29 +1,36 @@
-# relayctl 配置文件示例
-# 默认路径: ~/.config/relayctl/sites.yaml (建议锁定权限为 600: chmod 600 sites.yaml)
+# relayctl v2 站点文件示例
+#
+# 用法：把本文件复制为 $RELAYCTL_HOME/sites/demo.yaml（默认 ~/.config/relayctl），
+# 文件名与 name 保持一致，权限 0600。
+# 本文件只是模板，不含任何真实地址或凭据。
+#
+#   cp sites.example.yaml ~/.config/relayctl/sites/demo.yaml
+#   chmod 600 ~/.config/relayctl/sites/demo.yaml
 
-sites:
-  # 标准 New API 站点示例 (最常见)
-  # 凭据获取方式: 登录站点后台 -> 个人设置 -> 生成「系统访问令牌」
-  mysite-newapi:
-    tier: api                  # 级别: api (全自动管理) 或 parked (已搁置)
-    adapter: newapi            # 适配器类型: newapi 或 oneapi
-    base: https://api.example.com
-    proxy: auto                # 代理策略: auto (跟随系统代理环境变量), none (强制直连), 或指定 http://127.0.0.1:7890
-    auth:
-      access_token: "your-upstream-system-access-token"
-      user_id: 12345           # New API 站点通常需要提供 UID 配合 New-Api-User 鉴权
-
-  # 传统 One API 站点示例
-  mysite-oneapi:
-    tier: api
-    adapter: oneapi
-    base: https://oneapi.example.com
-    proxy: none
-    auth:
-      access_token: "your-upstream-system-access-token"
-
-  # 暂无凭据或搁置站点示例
-  mysite-parked:
-    tier: parked
-    base: https://parked.example.com
-    parked_reason: "等待在个人设置中生成长期系统访问令牌"
+name: demo                              # 站点名，必须与文件名一致
+base: https://api.example.com           # API 地址，必须是 http(s)://
+console_url: https://panel.example.com  # 控制台地址（可留空）
+panel: newapi                           # 面板类型: newapi / oneapi / custom
+adapter: newapi                         # 适配器: newapi / oneapi / script
+script: null                            # adapter=script 时填 scripts/demo.py
+auth:
+  type: access_token                    # access_token / cookie / password / none
+  access_token: ''                      # 明文令牌：留空，改用 access_token_env
+  access_token_env: DEMO_ACCESS_TOKEN   # 从环境变量读令牌（明文不落盘）
+  user_id: 12345                        # New API 的 UID，不需要时写 null
+  username: ''                          # auth.type=password 时的用户名
+  password: ''                          # 明文密码：留空，改用 password_env
+  password_env: ''
+  cookie: ''                            # auth.type=cookie 时的登录态
+docs:                                   # 四个字段必须齐全，允许空字符串
+  login_method: 控制台账号密码登录
+  token_howto: 控制台 → 个人设置 → 系统访问令牌
+  script_howto: ''
+  notes: 长期令牌，不要提交到 git
+proxy: ''                               # 空=继承全局 / none / auto / http://host:port
+refresh_interval: 30m                   # 空=继承全局；支持 30s / 30m / 2h / 1d
+tags:
+  - team
+  - primary
+status: active                          # active / parked
+parked_reason: ''                       # status=parked 时写搁置原因

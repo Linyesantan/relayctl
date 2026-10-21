@@ -81,6 +81,26 @@ class CliJsonTests(unittest.TestCase):
                 if isinstance(action, argparse._SubParsersAction):
                     stack.extend(action.choices.values())
 
+    def test_masked_key_is_not_redacted_twice(self):
+        """key_masked（前4...后4）是给消费方人工比对的，不应再被打成 ***。"""
+        from relayctl import importers
+
+        key = "sk-PLAINTEXTKEY1234567890"
+        importers.apply_keys_import(
+            *importers.parse_keys(key, fmt="txt"), cfg=config.load_config())
+        code, payload, _ = self.run_cli("dist", "list", "--json")
+        self.assertEqual(code, 0)
+        items = payload["data"] if isinstance(payload.get("data"), list) else payload["items"]
+        self.assertTrue(items)
+        self.assertEqual(items[0]["key_masked"], importers.mask_key(key))
+        self.assertNotIn(key, json.dumps(payload, ensure_ascii=False))
+
+    def test_plaintext_key_is_still_redacted(self):
+        """完整明文 Key 即使绕过 dist 路径，也必须被打码。"""
+        redacted = CLI._redact_strings({"note": "key is sk-REALPLAINTEXT123456"})
+        self.assertNotIn("sk-REALPLAINTEXT123456", json.dumps(redacted, ensure_ascii=False))
+        self.assertIn("***", json.dumps(redacted, ensure_ascii=False))
+
 
 if __name__ == "__main__":
     unittest.main()

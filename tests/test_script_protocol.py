@@ -602,6 +602,20 @@ class ScriptCliTests(ScriptHomeMixin, unittest.TestCase):
         self.assertIn("probe", out)
         self.assertNotIn("delete_key", out)
 
+    def test_script_test_works_on_parked_site(self):
+        """adapter=script 的站点即使被搁置（parked）也必须能体检。"""
+        self.add_site("demo", status=config.STATUS_PARKED,
+                      parked_reason="等待补齐凭据")
+        rc, out, _ = self.run_cli("script", "new", "demo")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(config.load_site("demo")["status"], config.STATUS_PARKED)
+
+        rc, out, _ = self.run_cli("script", "test", "demo", "--json")
+        self.assertEqual(rc, 0, out)
+        payload = json.loads(out)
+        self.assertTrue(payload["data"]["ok"])
+        self.assertEqual(payload["data"]["summary"]["unsupported"], len(rscript.ACTIONS))
+
     def test_script_test_reports_failure(self):
         self.add_site("demo", adapter="script", script="scripts/demo.py")
         self.write_script("demo.py", "print('oops')\n")

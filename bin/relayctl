@@ -6,6 +6,7 @@ v2 运行时布局: $RELAYCTL_HOME/{config.yaml,sites/<name>.yaml,scripts/,cache
 
 import sys
 import os
+import re
 import argparse
 import contextlib
 import io
@@ -582,11 +583,15 @@ def _script_status_text(status: str) -> str:
 
 def cmd_script_test(args, cfg):
     s_cfg = _site(cfg, args.site)
-    adapter = get_adapter(args.site, s_cfg, cfg)
-    if getattr(adapter, "NAME", None) != "script":
+    # 搁置（parked）站点也会被 get_adapter 拦截，因此这里直接按配置判定：
+    # adapter=script 就该能体检，否则给出可执行的操作指引。
+    if str(s_cfg.get("adapter") or "").strip().lower() != "script":
         raise ConfigError(
             f"站点 {args.site} 的 adapter 不是 script（当前 {s_cfg.get('adapter')}），"
             f"请先执行 relayctl script new {args.site}")
+    from relayctl.adapters.script import ScriptAdapter
+
+    adapter = ScriptAdapter(args.site, s_cfg, cfg)
 
     actions = [args.action] if args.action else list(rscript.ACTIONS)
     outcomes = adapter.test_actions(actions)
@@ -1103,6 +1108,9 @@ def _command_name(args) -> str:
     return " ".join(str(part) for part in parts if part)
 
 
+_RAW_SECRET_RE = re.compile(r"sk-[A-Za-z0-9_\-]{12,}")
+
+
 def _redact_strings(value):
     if isinstance(value, dict):
         return {key: _redact_strings(item) for key, item in value.items()}
@@ -1111,6 +1119,10 @@ def _redact_strings(value):
     if isinstance(value, tuple):
         return [_redact_strings(item) for item in value]
     if isinstance(value, str):
+        # 已经是脱敏形态（key_masked 的 `前4...后4`）就不再二次遮盖，
+        # 否则 JSON 消费方拿不到可用于人工比对的脱敏值。
+        if "..." in value and not _RAW_SECRET_RE.search(value):
+            return value
         return rcache.redact_text(value)
     return value
 
