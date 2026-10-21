@@ -260,7 +260,9 @@ def run(check_connectivity: bool = False) -> Tuple[Dict[str, Any], int]:
     if check_connectivity:
         _connectivity_checks(checks, global_cfg, sites)
 
-    codes = [int(item["_exit_code"]) for item in checks if not item["ok"]]
+    # 仅统计真正失败的退出码；warn 级检查（_exit_code=EXIT_OK）不使 doctor 失败。
+    codes = [int(item["_exit_code"]) for item in checks
+             if not item["ok"] and int(item["_exit_code"]) != EXIT_OK]
     exit_code = EXIT_USAGE if EXIT_USAGE in codes else (EXIT_FAIL if codes else EXIT_OK)
     public = [{k: v for k, v in item.items() if not k.startswith("_")} for item in checks]
     summary = {
