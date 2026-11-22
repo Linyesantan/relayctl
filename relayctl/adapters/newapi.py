@@ -323,6 +323,48 @@ class NewAPIAdapter(BaseAdapter):
                 break
 
         if not parsed_ok:
+            # 兼容部分魔改面板的 /api/v1/keys 端点
+            if last_status == 404:
+                try:
+                    r_v1 = self.client.get("/api/v1/keys")
+                    self._check_auth_response(r_v1)
+                    if r_v1.status_code == 200:
+                        d_v1 = r_v1.json()
+                        self._check_auth_response(r_v1, d_v1)
+                        if d_v1.get("code") == 0 and "data" in d_v1:
+                            v1_data = d_v1["data"]
+                            raw_items = v1_data.get("items") if isinstance(v1_data, dict) else v1_data
+                            keys = []
+                            for it in (raw_items or []):
+                                if not isinstance(it, dict):
+                                    continue
+                                group_val = it.get("group")
+                                g_name = group_val.get("name", "default") if isinstance(group_val, dict) else (group_val or "default")
+                                unlimited = (it.get("quota") == 0) or bool(it.get("unlimited_quota"))
+                                status_val = it.get("status")
+                                enabled = (status_val == "active" or status_val == 1)
+                                remain = "无限" if unlimited else f"{it.get('quota', 0) / unit:.4f}"
+                                used = f"{it.get('quota_used', 0) / unit:.4f}"
+                                norm = models.normalize_key({
+                                    "id": it.get("id"),
+                                    "name": it.get("name", ""),
+                                    "group": g_name,
+                                    "status": 1 if enabled else 2,
+                                    "enabled": enabled,
+                                    "unlimited": unlimited,
+                                    "remain": remain,
+                                    "used": used,
+                                    "key": it.get("key", ""),
+                                    "models": it.get("models") or "",
+                                })
+                                if norm:
+                                    keys.append(norm)
+                            return keys
+                except AuthError:
+                    raise
+                except Exception:
+                    pass
+
             # 魔改面板上 /api/token/ 不可用时，别再静默返回空列表假装 0 个 Key
             raise NotSupported(
                 f"站点 {self.name} 的 Key 列表接口不可用（{last_status or '未知错误'}），无法自动统计 Key 数。"
